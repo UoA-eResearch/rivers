@@ -82,6 +82,8 @@ def get_features(row):
     return pd.Series(row)
 
 for tilename in tqdm(manifest.tilename):
+    if os.path.isfile(f"{tilename}.parquet"):
+        continue
     old = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2018-2020/dem_1m/2193/{tilename}.tiff")
     new = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2023/dem_1m/2193/{tilename}.tiff")
     diff = new.read(1) - old.read(1)
