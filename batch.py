@@ -61,29 +61,48 @@ def get_features(row):
         "distance_to_river": geom.distance(all_streams)
     })
 
-    row.update(LCDB.loc[LCDB.intersects(geom), ["Class_2018", "Wetland_18", "Onshore_18"]].mode().iloc[0].replace({"no": False, "yes": True}))
+    if any(LCDB.intersects(geom)):
+        row.update(LCDB.loc[LCDB.intersects(geom), ["Class_2018", "Wetland_18", "Onshore_18"]].mode().iloc[0].replace({"no": False, "yes": True}))
 
     attribute_names = ["roughness", "slope", "aspect", "curvature", "terrain_ruggedness_index", "rugosity", "profile_curvature", "planform_curvature"]
-    attributes = xdem.terrain.get_terrain_attribute(
+    diff_attributes = xdem.terrain.get_terrain_attribute(
         masked_diff,
+        resolution=old.res,
+        attribute=attribute_names
+    )
+    old_attributes = xdem.terrain.get_terrain_attribute(
+        masked_old,
+        resolution=old.res,
+        attribute=attribute_names
+    )
+    new_attributes = xdem.terrain.get_terrain_attribute(
+        masked_new,
         resolution=old.res,
         attribute=attribute_names
     )
 
     for i, name in enumerate(attribute_names):
         row.update({
-            f"{name}_min": np.nanmin(attributes[i]),
-            f"{name}_max": np.nanmax(attributes[i]),
-            f"{name}_mean": np.nanmean(attributes[i]),
-            f"{name}_median": np.nanmedian(attributes[i]),
-            f"{name}_std": np.nanstd(attributes[i]),
+            f"old_{name}_min": np.nanmin(old_attributes[i]),
+            f"old_{name}_max": np.nanmax(old_attributes[i]),
+            f"old_{name}_mean": np.nanmean(old_attributes[i]),
+            f"old_{name}_median": np.nanmedian(old_attributes[i]),
+            f"old_{name}_std": np.nanstd(old_attributes[i]),
+            f"new_{name}_min": np.nanmin(new_attributes[i]),
+            f"new_{name}_max": np.nanmax(new_attributes[i]),
+            f"new_{name}_mean": np.nanmean(new_attributes[i]),
+            f"new_{name}_median": np.nanmedian(new_attributes[i]),
+            f"new_{name}_std": np.nanstd(new_attributes[i]),
+            f"diff_{name}_min": np.nanmin(diff_attributes[i]),
+            f"diff_{name}_max": np.nanmax(diff_attributes[i]),
+            f"diff_{name}_mean": np.nanmean(diff_attributes[i]),
+            f"diff_{name}_median": np.nanmedian(diff_attributes[i]),
+            f"diff_{name}_std": np.nanstd(diff_attributes[i]),
         })
 
     return pd.Series(row)
 
 for tilename in tqdm(manifest.tilename):
-    if os.path.isfile(f"{tilename}.parquet"):
-        continue
     old = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2018-2020/dem_1m/2193/{tilename}.tiff")
     new = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2023/dem_1m/2193/{tilename}.tiff")
     diff = new.read(1) - old.read(1)
