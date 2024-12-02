@@ -103,15 +103,23 @@ def get_features(row):
     return pd.Series(row)
 
 for tilename in tqdm(manifest.tilename):
-    old = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2018-2020/dem_1m/2193/{tilename}.tiff")
-    new = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2023/dem_1m/2193/{tilename}.tiff")
-    diff = new.read(1) - old.read(1)
-    result = diff.round().clip(min=-1, max=1).astype(np.int16)
-    result = sieve(result, 4000)
-    result = np.where(result != 0, result, np.nan)
-    areas = gpd.GeoDataFrame(geometry=[shape(s) for s, v in shapes(result, transform=new.transform) if not np.isnan(v)])
-    areas["area"] = areas.area
-    areas.sort_values("area", ascending=False, inplace=True)
-    features = areas.progress_apply(get_features, axis=1)
-    features.crs = 2193
-    features.to_parquet(f"{tilename}.parquet")
+    if os.path.exists(f"{tilename}.parquet"):
+        continue
+    try:
+        old = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2018-2020/dem_1m/2193/{tilename}.tiff")
+        new = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2023/dem_1m/2193/{tilename}.tiff")
+        diff = new.read(1) - old.read(1)
+        result = diff.round().clip(min=-1, max=1).astype(np.int16)
+        result = sieve(result, 4000)
+        result = np.where(result != 0, result, np.nan)
+        areas = gpd.GeoDataFrame(geometry=[shape(s) for s, v in shapes(result, transform=new.transform) if not np.isnan(v)])
+        areas["area"] = areas.area
+        # Not sure why I have to do this again, the sieve above should have done it. Had some very small polygons somehow anyway.
+        areas = areas[areas.area > 4000]
+        areas.sort_values("area", ascending=False, inplace=True)
+        features = areas.progress_apply(get_features, axis=1)
+        features.crs = 2193
+        features.to_parquet(f"{tilename}.parquet")
+    except Exception as e:
+        print(f"Failed on {tilename}: {e}")
+        continue
