@@ -7509,7 +7509,7 @@ a.anchor-link {
 </style>
 <!-- End of mermaid configuration --></head>
 <body class="jp-Notebook" data-jp-theme-light="true" data-jp-theme-name="JupyterLab Light">
-<main><div class="jp-Cell jp-CodeCell jp-Notebook-cell jp-mod-noOutputs">
+<main><div class="jp-Cell jp-CodeCell jp-Notebook-cell">
 <div class="jp-Cell-inputWrapper" tabindex="0">
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
@@ -7517,7 +7517,8 @@ a.anchor-link {
 <div class="jp-InputPrompt jp-InputArea-prompt">In [1]:</div>
 <div class="jp-CodeMirrorEditor jp-Editor jp-InputArea-editor" data-type="inline">
 <div class="cm-editor cm-s-jupyter">
-<div class="highlight hl-ipython3"><pre><span></span><span class="kn">import</span> <span class="nn">rasterio</span>
+<div class="highlight hl-ipython3"><pre><span></span><span class="o">%</span><span class="k">reload_ext</span> autotime
+<span class="kn">import</span> <span class="nn">rasterio</span>
 <span class="kn">import</span> <span class="nn">requests</span>
 <span class="kn">from</span> <span class="nn">rasterio.features</span> <span class="kn">import</span> <span class="n">shapes</span><span class="p">,</span> <span class="n">sieve</span><span class="p">,</span> <span class="n">rasterize</span>
 <span class="kn">from</span> <span class="nn">rasterio.plot</span> <span class="kn">import</span> <span class="n">show</span>
@@ -7538,7 +7539,19 @@ a.anchor-link {
 </div>
 </div>
 </div>
-</div><div class="jp-Cell jp-CodeCell jp-Notebook-cell jp-mod-noOutputs">
+<div class="jp-Cell-outputWrapper">
+<div class="jp-Collapser jp-OutputCollapser jp-Cell-outputCollapser">
+</div>
+<div class="jp-OutputArea jp-Cell-outputArea">
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 2.35 s (2024-12-09T12:39:06/2024-12-09T12:39:08)</pre>
+</div>
+</div>
+</div>
+</div>
+</div><div class="jp-Cell jp-CodeCell jp-Notebook-cell">
 <div class="jp-Cell-inputWrapper" tabindex="0">
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
@@ -7550,7 +7563,26 @@ a.anchor-link {
 <span class="n">old_data</span> <span class="o">=</span> <span class="n">old</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
 <span class="n">new</span> <span class="o">=</span> <span class="n">rasterio</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="s2">"NDVI_2023.tif"</span><span class="p">)</span>
 <span class="n">new_data</span> <span class="o">=</span> <span class="n">new</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">old</span><span class="o">.</span><span class="n">res</span><span class="p">,</span> <span class="n">new</span><span class="o">.</span><span class="n">res</span>
 </pre></div>
+</div>
+</div>
+</div>
+</div>
+<div class="jp-Cell-outputWrapper">
+<div class="jp-Collapser jp-OutputCollapser jp-Cell-outputCollapser">
+</div>
+<div class="jp-OutputArea jp-Cell-outputArea">
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 9.41 s (2024-12-09T12:39:08/2024-12-09T12:39:18)</pre>
+</div>
+</div>
+<div class="jp-OutputArea-child jp-OutputArea-executeResult">
+<div class="jp-OutputPrompt jp-OutputArea-prompt">Out[2]:</div>
+<div class="jp-RenderedText jp-OutputArea-output jp-OutputArea-executeResult" data-mime-type="text/plain" tabindex="0">
+<pre>((10.0, 10.0), (10.0, 10.0))</pre>
 </div>
 </div>
 </div>
@@ -7575,10 +7607,16 @@ a.anchor-link {
 <div class="jp-Collapser jp-OutputCollapser jp-Cell-outputCollapser">
 </div>
 <div class="jp-OutputArea jp-Cell-outputArea">
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 7.58 s (2024-12-09T12:39:18/2024-12-09T12:39:25)</pre>
+</div>
+</div>
 <div class="jp-OutputArea-child jp-OutputArea-executeResult">
 <div class="jp-OutputPrompt jp-OutputArea-prompt">Out[3]:</div>
 <div class="jp-RenderedText jp-OutputArea-output jp-OutputArea-executeResult" data-mime-type="text/plain" tabindex="0">
-<pre>&lt;matplotlib.colorbar.Colorbar at 0x7f02dc790f40&gt;</pre>
+<pre>&lt;matplotlib.colorbar.Colorbar at 0x7f0854be62c0&gt;</pre>
 </div>
 </div>
 <div class="jp-OutputArea-child">
@@ -7609,10 +7647,16 @@ a.anchor-link {
 <div class="jp-Collapser jp-OutputCollapser jp-Cell-outputCollapser">
 </div>
 <div class="jp-OutputArea jp-Cell-outputArea">
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 7.06 s (2024-12-09T12:39:26/2024-12-09T12:39:33)</pre>
+</div>
+</div>
 <div class="jp-OutputArea-child jp-OutputArea-executeResult">
 <div class="jp-OutputPrompt jp-OutputArea-prompt">Out[4]:</div>
 <div class="jp-RenderedText jp-OutputArea-output jp-OutputArea-executeResult" data-mime-type="text/plain" tabindex="0">
-<pre>&lt;matplotlib.colorbar.Colorbar at 0x7f0241ddb6a0&gt;</pre>
+<pre>&lt;matplotlib.colorbar.Colorbar at 0x7f07b4a42530&gt;</pre>
 </div>
 </div>
 <div class="jp-OutputArea-child">
@@ -7646,8 +7690,14 @@ a.anchor-link {
 <div class="jp-OutputArea jp-Cell-outputArea">
 <div class="jp-OutputArea-child">
 <div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 8.37 s (2024-12-09T12:39:33/2024-12-09T12:39:41)</pre>
+</div>
+</div>
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
 <div class="jp-RenderedText jp-OutputArea-output" data-mime-type="application/vnd.jupyter.stderr" tabindex="0">
-<pre>/tmp/ipykernel_4153252/58089339.py:1: RuntimeWarning: invalid value encountered in subtract
+<pre>/tmp/ipykernel_178175/58089339.py:1: RuntimeWarning: invalid value encountered in subtract
   diff = new_data - old_data
 </pre>
 </div>
@@ -7655,7 +7705,7 @@ a.anchor-link {
 <div class="jp-OutputArea-child jp-OutputArea-executeResult">
 <div class="jp-OutputPrompt jp-OutputArea-prompt">Out[5]:</div>
 <div class="jp-RenderedText jp-OutputArea-output jp-OutputArea-executeResult" data-mime-type="text/plain" tabindex="0">
-<pre>&lt;matplotlib.colorbar.Colorbar at 0x7f02404f2a40&gt;</pre>
+<pre>&lt;matplotlib.colorbar.Colorbar at 0x7f07b491f610&gt;</pre>
 </div>
 </div>
 <div class="jp-OutputArea-child">
@@ -7685,6 +7735,12 @@ a.anchor-link {
 <div class="jp-Collapser jp-OutputCollapser jp-Cell-outputCollapser">
 </div>
 <div class="jp-OutputArea jp-Cell-outputArea">
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 3.33 s (2024-12-09T12:39:41/2024-12-09T12:39:45)</pre>
+</div>
+</div>
 <div class="jp-OutputArea-child jp-OutputArea-executeResult">
 <div class="jp-OutputPrompt jp-OutputArea-prompt">Out[6]:</div>
 <div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output jp-OutputArea-executeResult" data-mime-type="text/html" tabindex="0">
@@ -8021,6 +8077,12 @@ a.anchor-link {
 <div class="jp-Collapser jp-OutputCollapser jp-Cell-outputCollapser">
 </div>
 <div class="jp-OutputArea jp-Cell-outputArea">
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 17.9 ms (2024-12-09T12:39:45/2024-12-09T12:39:45)</pre>
+</div>
+</div>
 <div class="jp-OutputArea-child jp-OutputArea-executeResult">
 <div class="jp-OutputPrompt jp-OutputArea-prompt">Out[7]:</div>
 <div class="jp-RenderedSVG jp-OutputArea-output jp-OutputArea-executeResult" data-mime-type="image/svg+xml" tabindex="0">
@@ -8034,7 +8096,7 @@ a.anchor-link {
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
 <div class="jp-InputArea jp-Cell-inputArea">
-<div class="jp-InputPrompt jp-InputArea-prompt">In [15]:</div>
+<div class="jp-InputPrompt jp-InputArea-prompt">In [8]:</div>
 <div class="jp-CodeMirrorEditor jp-Editor jp-InputArea-editor" data-type="inline">
 <div class="cm-editor cm-s-jupyter">
 <div class="highlight hl-ipython3"><pre><span></span><span class="n">masked_old</span><span class="p">,</span> <span class="n">transform</span> <span class="o">=</span> <span class="n">mask</span><span class="p">(</span><span class="n">old</span><span class="p">,</span> <span class="p">[</span><span class="n">geom</span><span class="p">],</span> <span class="n">nodata</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">nan</span><span class="p">,</span> <span class="n">crop</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -8054,6 +8116,12 @@ a.anchor-link {
 <div class="jp-OutputArea jp-Cell-outputArea">
 <div class="jp-OutputArea-child">
 <div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 194 ms (2024-12-09T12:39:45/2024-12-09T12:39:45)</pre>
+</div>
+</div>
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
 <div class="jp-RenderedImage jp-OutputArea-output" tabindex="0">
 <img alt="No description has been provided for this image" class="" src="data:image/png;base64,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"/>
 </div>
@@ -8071,7 +8139,7 @@ a.anchor-link {
 </div>
 </div>
 <div class="jp-OutputArea-child jp-OutputArea-executeResult">
-<div class="jp-OutputPrompt jp-OutputArea-prompt">Out[15]:</div>
+<div class="jp-OutputPrompt jp-OutputArea-prompt">Out[8]:</div>
 <div class="jp-RenderedText jp-OutputArea-output jp-OutputArea-executeResult" data-mime-type="text/plain" tabindex="0">
 <pre>&lt;Axes: &gt;</pre>
 </div>
@@ -8083,7 +8151,7 @@ a.anchor-link {
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
 <div class="jp-InputArea jp-Cell-inputArea">
-<div class="jp-InputPrompt jp-InputArea-prompt">In [16]:</div>
+<div class="jp-InputPrompt jp-InputArea-prompt">In [9]:</div>
 <div class="jp-CodeMirrorEditor jp-Editor jp-InputArea-editor" data-type="inline">
 <div class="cm-editor cm-s-jupyter">
 <div class="highlight hl-ipython3"><pre><span></span><span class="k">def</span> <span class="nf">get_features</span><span class="p">(</span><span class="n">row</span><span class="p">):</span>
@@ -8122,6 +8190,12 @@ a.anchor-link {
 <div class="jp-Collapser jp-OutputCollapser jp-Cell-outputCollapser">
 </div>
 <div class="jp-OutputArea jp-Cell-outputArea">
+<div class="jp-OutputArea-child">
+<div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
+<div class="jp-RenderedHTMLCommon jp-RenderedHTML jp-OutputArea-output" data-mime-type="text/html" tabindex="0">
+<pre>✔️ 3 min 3 s (2024-12-09T12:39:45/2024-12-09T12:42:49)</pre>
+</div>
+</div>
 <div class="jp-OutputArea-child">
 <div class="jp-OutputPrompt jp-OutputArea-prompt"></div>
 <div class="jp-RenderedText jp-OutputArea-output" data-mime-type="text/plain" tabindex="0">
