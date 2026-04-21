@@ -34,7 +34,7 @@ The analysis identifies areas of significant elevation change (erosion or deposi
 
 ```
 .
-├── data/                           # Data files (not committed to git)
+├── data/                           # Data files (large files tracked via Git LFS)
 │   ├── NDVI_2018.tif              # NDVI raster for 2018
 │   ├── NDVI_2023.tif              # NDVI raster for 2023
 │   ├── REC2_geodata_version_5.zip # River Environment Classification data

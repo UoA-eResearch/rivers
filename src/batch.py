@@ -64,24 +64,48 @@ def load_global_data():
     return REC, all_streams, LCDB, river_polygons
 
 
-def compute_hydrological_indices(dem_path, tilename):
-    """Compute hydrological indices using WhiteboxTools."""
+def compute_hydrological_indices(dem_path, streams_path, tilename):
+    """Compute hydrological indices using WhiteboxTools.
+
+    Parameters
+    ----------
+    dem_path : str
+        Path to local DEM raster file.
+    streams_path : str
+        Path to streams vector file (e.g. GeoPackage).
+    tilename : str
+        Tile identifier used to name output files.
+
+    Returns
+    -------
+    tuple of rasterio.DatasetReader or None
+        Opened datasets for (downslope_dist, elev_above_stream, depth_to_water).
+    """
     wbt = whitebox.WhiteboxTools()
     wbt.set_verbose_mode(False)
 
     os.makedirs(WBT_DIR, exist_ok=True)
 
     # Output paths
+    streams_raster = f"{WBT_DIR}/{tilename}_streams.tif"
     downslope_dist = f"{WBT_DIR}/{tilename}_downslope_dist.tif"
     elev_above_stream = f"{WBT_DIR}/{tilename}_elev_above_stream.tif"
     depth_to_water = f"{WBT_DIR}/{tilename}_depth_to_water.tif"
 
     try:
+        # Rasterize streams to match DEM extent/resolution
+        if not os.path.exists(streams_raster):
+            wbt.rasterize_streams(
+                streams=streams_path,
+                base=dem_path,
+                output=streams_raster
+            )
+
         # DownslopeDistanceToStream
         if not os.path.exists(downslope_dist):
             wbt.downslope_distance_to_stream(
                 dem=dem_path,
-                streams=dem_path,  # Will need stream network
+                streams=streams_raster,
                 output=downslope_dist
             )
 
@@ -89,18 +113,22 @@ def compute_hydrological_indices(dem_path, tilename):
         if not os.path.exists(elev_above_stream):
             wbt.elevation_above_stream_euclidean(
                 dem=dem_path,
-                streams=dem_path,  # Will need stream network
+                streams=streams_raster,
                 output=elev_above_stream
             )
 
-        # DepthToWater (if applicable)
+        # DepthToWater
         if not os.path.exists(depth_to_water):
             wbt.depth_to_water(
                 dem=dem_path,
                 output=depth_to_water
             )
 
-        return downslope_dist, elev_above_stream, depth_to_water
+        return (
+            rasterio.open(downslope_dist) if os.path.exists(downslope_dist) else None,
+            rasterio.open(elev_above_stream) if os.path.exists(elev_above_stream) else None,
+            rasterio.open(depth_to_water) if os.path.exists(depth_to_water) else None,
+        )
     except Exception as e:
         print(f"WhiteboxTools error: {e}")
         return None, None, None
@@ -114,12 +142,17 @@ def split_by_river_polygons(areas, river_polygons):
 
     print("Splitting polygons by river boundaries...")
     split_areas = []
+    river_sindex = river_polygons.sindex
 
     for idx, row in tqdm(areas.iterrows(), total=len(areas), desc="Splitting polygons"):
         geom = row.geometry
 
-        # Check if polygon intersects any river polygons
-        intersecting_rivers = river_polygons[river_polygons.intersects(geom)]
+        # Use spatial index to preselect candidate river polygons
+        candidate_idx = river_sindex.query(geom, predicate="intersects")
+        if len(candidate_idx) == 0:
+            intersecting_rivers = river_polygons.iloc[0:0]
+        else:
+            intersecting_rivers = river_polygons.iloc[candidate_idx]
 
         if len(intersecting_rivers) == 0:
             # No intersection, keep original
@@ -167,16 +200,22 @@ def get_features(row, old, new, diff, result, all_streams, LCDB, hydro_rasters=N
     geom = row.geometry
     masked_old, transform = mask(old, [geom], nodata=np.nan)
     nonan = np.argwhere(~np.isnan(masked_old[0]))
-    top_left = nonan.min(axis=0)
-    bottom_right = nonan.max(axis=0)
-    masked_old = masked_old[0][top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
 
-    masked_new, transform = mask(new, [geom], nodata=np.nan)
-    masked_new = masked_new[0][top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
+    if nonan.size == 0:
+        masked_old = np.array([[np.nan]])
+        masked_new = np.array([[np.nan]])
+        masked_diff = np.array([[np.nan]])
+    else:
+        top_left = nonan.min(axis=0)
+        bottom_right = nonan.max(axis=0)
+        masked_old = masked_old[0][top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
 
-    raster = rasterize([geom], out_shape=result.shape, transform=new.transform)
-    masked_diff = np.where(raster, diff, np.nan)
-    masked_diff = masked_diff[top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
+        masked_new, transform = mask(new, [geom], nodata=np.nan)
+        masked_new = masked_new[0][top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
+
+        raster = rasterize([geom], out_shape=result.shape, transform=new.transform)
+        masked_diff = np.where(raster, diff, np.nan)
+        masked_diff = masked_diff[top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
 
     row = row.to_dict()
     row.update({
@@ -229,8 +268,16 @@ def get_features(row, old, new, diff, result, all_streams, LCDB, hydro_rasters=N
         except Exception as e:
             print(f"Error processing hydrological indices: {e}")
 
-    if any(LCDB.intersects(geom)):
-        row.update(LCDB.loc[LCDB.intersects(geom), ["Class_2018", "Wetland_18", "Onshore_18"]].mode().iloc[0].replace({"no": False, "yes": True}))
+    lcdb_candidate_idx = LCDB.sindex.query(geom, predicate="intersects")
+    if len(lcdb_candidate_idx) > 0:
+        lcdb_candidates = LCDB.iloc[lcdb_candidate_idx]
+        lcdb_intersections = lcdb_candidates.intersects(geom)
+        if lcdb_intersections.any():
+            row.update(
+                lcdb_candidates.loc[
+                    lcdb_intersections, ["Class_2018", "Wetland_18", "Onshore_18"]
+                ].mode().iloc[0].replace({"no": False, "yes": True})
+            )
 
     attribute_names = ["roughness", "slope", "aspect", "curvature", "terrain_ruggedness_index", "rugosity", "profile_curvature", "planform_curvature"]
     diff_attributes = xdem.terrain.get_terrain_attribute(
@@ -281,6 +328,7 @@ def add_ndvi_features(areas):
 
     old_ndvi = rasterio.open(f"{DATA_DIR}/NDVI_2018.tif")
     new_ndvi = rasterio.open(f"{DATA_DIR}/NDVI_2023.tif")
+    original_crs = areas.crs
 
     def get_ndvi_features(row):
         geom = row.geometry
@@ -308,6 +356,7 @@ def add_ndvi_features(areas):
         return pd.Series(row)
 
     areas = areas.progress_apply(get_ndvi_features, axis=1)
+    areas = gpd.GeoDataFrame(areas, geometry="geometry", crs=original_crs)
     return areas
 
 
@@ -337,12 +386,15 @@ def join_parquet_files():
 
 def process_tiles(REC, all_streams, LCDB, river_polygons):
     """Process DEM tiles to extract areas of change."""
+    from shapely.geometry import box as shapely_box
+
     manifest = pd.json_normalize(requests.get("https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2023/dem_1m/2193/collection.json").json()["links"])
     manifest = manifest[manifest["rel"] == "item"]
     manifest["tilename"] = manifest.href.str.replace(".json", "").str.strip("./")
 
     # Create tile results directory
     os.makedirs(TILE_RESULTS_DIR, exist_ok=True)
+    os.makedirs(WBT_DIR, exist_ok=True)
 
     for tilename in tqdm(manifest.tilename, desc="Processing tiles"):
         output_path = f"{TILE_RESULTS_DIR}/{tilename}.parquet"
@@ -368,17 +420,35 @@ def process_tiles(REC, all_streams, LCDB, river_polygons):
                 areas = split_by_river_polygons(areas, river_polygons)
 
             # Compute hydrological indices using WhiteboxTools
-            # Note: This requires saving DEM to local file first
-            # For now, skip WhiteboxTools and use None
-            hydro_rasters = None
-            # hydro_rasters = compute_hydrological_indices(new, tilename)
+            # Save DEM to local file so WhiteboxTools can process it
+            tile_dem_path = f"{WBT_DIR}/{tilename}_dem.tif"
+            tile_streams_path = f"{WBT_DIR}/{tilename}_streams.gpkg"
+            hydro_rasters = None, None, None
+
+            if not os.path.exists(tile_dem_path):
+                with rasterio.open(tile_dem_path, 'w', **new.meta) as dst:
+                    dst.write(new.read())
+
+            # Clip REC streams to tile extent and save for rasterization
+            if not os.path.exists(tile_streams_path):
+                bounds = new.bounds
+                tile_bbox = gpd.GeoDataFrame(
+                    geometry=[shapely_box(bounds.left, bounds.bottom, bounds.right, bounds.top)],
+                    crs=new.crs
+                )
+                streams_clipped = gpd.clip(REC, tile_bbox)
+                if not streams_clipped.empty:
+                    streams_clipped.to_file(tile_streams_path, driver='GPKG')
+
+            if os.path.exists(tile_streams_path):
+                hydro_rasters = compute_hydrological_indices(tile_dem_path, tile_streams_path, tilename)
 
             # Now compute features on split polygons
             features = areas.progress_apply(
                 lambda row: get_features(row, old, new, diff, result, all_streams, LCDB, hydro_rasters),
                 axis=1
             )
-            features.crs = 2193
+            features = gpd.GeoDataFrame(features, geometry="geometry", crs=areas.crs)
             features.to_parquet(output_path)
         except Exception as e:
             print(f"Failed on {tilename}: {e}")
