@@ -2,6 +2,23 @@
 
 This repository contains code and data for analyzing erosion and sedimentation patterns in the Gisborne region of New Zealand using Digital Elevation Model (DEM) data from 2018-2020 and 2023, along with NDVI (Normalized Difference Vegetation Index) satellite imagery.
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Repository Structure](#repository-structure)
+- [How It Works](#how-it-works)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Data Schema](#data-schema)
+- [Visualizations](#visualizations)
+- [Key Findings](#key-findings)
+- [Future Enhancements](#future-enhancements)
+- [Data Sources](#data-sources)
+- [License](#license)
+- [Contributing](#contributing)
+- [Citation](#citation)
+- [Contact](#contact)
+
 ## Overview
 
 The analysis identifies areas of significant elevation change (erosion or deposition > 1m) between two time periods and characterizes these areas using:
