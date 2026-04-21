@@ -9,8 +9,8 @@ The analysis identifies areas of significant elevation change (erosion or deposi
 - **Terrain attributes**: slope, aspect, curvature, roughness, ruggedness
 - **Vegetation indices**: NDVI changes between 2018 and 2023
 - **Land cover data**: LCDB (Land Cover Database) classifications
-- **Hydrological context**: distance to rivers, river network data from REC2
-- **River polygons**: Integration with NZ river polygon data (topo 150k)
+- **Hydrological context**: distance to rivers, river network data from REC2, elevation above stream
+- **River polygons**: Splits analysis polygons based on river polygon boundaries
 - **Clustering**: K-means clustering to identify similar erosion/deposition patterns
 
 ## Repository Structure
@@ -54,12 +54,18 @@ The main processing pipeline performs the following steps:
    - Calculates elevation differences
    - Identifies areas with > 1m change using sieving (minimum 4000 m²)
    - Extracts terrain features for each polygon
+   - Calculates elevation above nearest stream
 
-3. **Add NDVI Features**
+3. **Split by River Polygons**
+   - Loads NZ river polygon data (topo 150k)
+   - Splits erosion/deposition polygons at river boundaries
+   - Maintains minimum area threshold after splitting
+
+4. **Add NDVI Features**
    - Masks NDVI rasters to each change polygon
    - Calculates statistics (min, max, mean, median, std) for old, new, and difference
 
-4. **Join Results**
+5. **Join Results**
    - Combines individual tile results into a single dataset
    - Saves as Parquet files for efficient storage and processing
 
@@ -112,7 +118,9 @@ python src/batch.py
 This will:
 - Process 305 DEM tiles from the Gisborne region
 - Extract terrain and NDVI features for ~21,000+ polygons
-- Save results to `data/areas.parquet` and `data/areas+NDVI.parquet`
+- Split polygons at river boundaries where applicable
+- Calculate elevation above stream for each polygon
+- Save results to `data/areas.parquet`, `data/areas_split.parquet`, and `data/areas+NDVI.parquet`
 - Progress is saved incrementally to `tile_results/` directory
 
 **Note**: This is a compute-intensive process that can take several hours to complete.
@@ -175,9 +183,11 @@ For each erosion/deposition polygon, the following features are extracted:
 **Context Features**:
 - `area`: Polygon area in m²
 - `distance_to_river`: Distance to nearest river (m)
+- `elevation_above_stream`: Elevation of polygon centroid above nearest stream (m)
 - `Class_2018`: LCDB land cover class
 - `Wetland_18`: Boolean wetland flag
 - `Onshore_18`: Boolean onshore flag
+- `split_by_river`: Boolean flag indicating if polygon was split by river boundary
 
 ## Visualizations
 
@@ -213,10 +223,9 @@ The analysis of ~21,886 erosion and deposition polygons across the Gisborne regi
 
 Planned additions to this analysis:
 
-- [ ] **River polygon splitting**: Split analysis polygons based on river boundaries
-- [ ] **Borselli's connectivity matrix**: Calculate sediment connectivity indices
+- [ ] **Borselli's connectivity matrix**: Calculate sediment connectivity indices using slope and land cover
 - [ ] **K-means weighting**: Implement weighted clustering for imbalanced features
-- [ ] **Elevation above stream**: Calculate height above nearest drainage
+- [ ] **Additional terrain indices**: Calculate TWI (Topographic Wetness Index), SPI (Stream Power Index)
 
 ## Data Sources
 

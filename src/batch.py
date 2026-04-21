@@ -62,7 +62,32 @@ def load_global_data():
     return REC, all_streams, LCDB, river_polygons
 
 
-def get_features(row, old, new, diff, result, all_streams, LCDB):
+def calculate_elevation_above_stream(geom, dem, streams_gdf):
+    """Calculate elevation above nearest stream."""
+    try:
+        # Get elevation at polygon centroid
+        centroid = geom.centroid
+        centroid_elev = list(dem.sample([(centroid.x, centroid.y)]))[0][0]
+
+        # Find nearest stream segment
+        nearest_stream = streams_gdf.iloc[streams_gdf.distance(centroid).idxmin()]
+
+        # Get stream elevation (use downElev if available)
+        if 'downElev' in streams_gdf.columns and not np.isnan(nearest_stream['downElev']):
+            stream_elev = nearest_stream['downElev']
+        elif 'upElev' in streams_gdf.columns and not np.isnan(nearest_stream['upElev']):
+            stream_elev = nearest_stream['upElev']
+        else:
+            # Sample DEM at nearest point on stream
+            nearest_point = nearest_stream.geometry.interpolate(nearest_stream.geometry.project(centroid))
+            stream_elev = list(dem.sample([(nearest_point.x, nearest_point.y)]))[0][0]
+
+        return centroid_elev - stream_elev
+    except:
+        return np.nan
+
+
+def get_features(row, old, new, diff, result, all_streams, LCDB, REC):
     """Extract features for a single polygon."""
     geom = row.geometry
     masked_old, transform = mask(old, [geom], nodata=np.nan)
@@ -97,6 +122,10 @@ def get_features(row, old, new, diff, result, all_streams, LCDB):
         "diff_std": np.nanstd(masked_diff),
         "distance_to_river": geom.distance(all_streams)
     })
+
+    # Calculate elevation above stream
+    elev_above_stream = calculate_elevation_above_stream(geom, new, REC)
+    row["elevation_above_stream"] = elev_above_stream
 
     if any(LCDB.intersects(geom)):
         row.update(LCDB.loc[LCDB.intersects(geom), ["Class_2018", "Wetland_18", "Onshore_18"]].mode().iloc[0].replace({"no": False, "yes": True}))
@@ -180,6 +209,61 @@ def add_ndvi_features(areas):
     return areas
 
 
+def split_by_river_polygons(areas, river_polygons):
+    """Split polygons based on river polygon boundaries."""
+    if river_polygons is None:
+        print("No river polygons available, skipping split")
+        return areas
+
+    print("Splitting polygons by river boundaries...")
+    split_areas = []
+
+    for idx, row in tqdm(areas.iterrows(), total=len(areas)):
+        geom = row.geometry
+
+        # Check if polygon intersects any river polygons
+        intersecting_rivers = river_polygons[river_polygons.intersects(geom)]
+
+        if len(intersecting_rivers) == 0:
+            # No intersection, keep original
+            split_areas.append(row)
+        else:
+            # Split by river polygons
+            try:
+                # Create difference with all intersecting rivers
+                remaining = geom
+                for _, river in intersecting_rivers.iterrows():
+                    remaining = remaining.difference(river.geometry)
+
+                # Add the split parts
+                if not remaining.is_empty:
+                    from shapely.geometry import MultiPolygon, Polygon
+                    if isinstance(remaining, MultiPolygon):
+                        for poly in remaining.geoms:
+                            if poly.area > 4000:  # Keep minimum area threshold
+                                new_row = row.copy()
+                                new_row.geometry = poly
+                                new_row['area'] = poly.area
+                                new_row['split_by_river'] = True
+                                split_areas.append(new_row)
+                    elif isinstance(remaining, Polygon) and remaining.area > 4000:
+                        new_row = row.copy()
+                        new_row.geometry = remaining
+                        new_row['area'] = remaining.area
+                        new_row['split_by_river'] = True
+                        split_areas.append(new_row)
+            except Exception as e:
+                # If splitting fails, keep original
+                print(f"Failed to split polygon {idx}: {e}")
+                row_copy = row.copy()
+                row_copy['split_by_river'] = False
+                split_areas.append(row_copy)
+
+    result = gpd.GeoDataFrame(split_areas, crs=areas.crs)
+    print(f"Split {len(areas)} polygons into {len(result)} polygons")
+    return result
+
+
 def join_parquet_files():
     """Join all individual tile parquet files into a single file."""
     print("Joining parquet files from tile_results/...")
@@ -229,7 +313,7 @@ def process_tiles(REC, all_streams, LCDB):
             # Not sure why I have to do this again, the sieve above should have done it. Had some very small polygons somehow anyway.
             areas = areas[areas.area > 4000]
             areas.sort_values("area", ascending=False, inplace=True)
-            features = areas.progress_apply(lambda row: get_features(row, old, new, diff, result, all_streams, LCDB), axis=1)
+            features = areas.progress_apply(lambda row: get_features(row, old, new, diff, result, all_streams, LCDB, REC), axis=1)
             features.crs = 2193
             features.to_parquet(output_path)
         except Exception as e:
@@ -256,6 +340,12 @@ def main():
         areas = gpd.read_parquet(f"{OUTPUT_DIR}/areas.parquet")
 
     if areas is not None:
+        # Split by river polygons if available
+        if river_polygons is not None:
+            areas = split_by_river_polygons(areas, river_polygons)
+            areas.to_parquet(f"{OUTPUT_DIR}/areas_split.parquet")
+            print(f"Saved split areas to {OUTPUT_DIR}/areas_split.parquet")
+
         # Add NDVI features
         areas_with_ndvi = add_ndvi_features(areas)
         areas_with_ndvi.to_parquet(f"{OUTPUT_DIR}/areas+NDVI.parquet")
