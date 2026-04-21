@@ -30,16 +30,9 @@ jobs:
 
     - name: Run clustering notebook
       run: |
-        jupyter nbconvert --to notebook --execute notebooks/clustering.ipynb --output clustering.ipynb
-
-    - name: Upload results
-      uses: actions/upload-artifact@v3
-      with:
-        name: processed-data
-        path: |
-          data/areas.parquet
-          data/areas+NDVI.parquet
-          data/clusters.parquet
-          data/clusters.gpkg
-          notebooks/clustering.ipynb
-        retention-days: 90
+        jupyter nbconvert --to notebook --execute notebooks/clustering.ipynb --output notebooks/clustering.ipynb
+        jupyter nbconvert --to html notebooks/clustering.ipynb --output clustering.html
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git pull
+        git commit -am "Update data"
