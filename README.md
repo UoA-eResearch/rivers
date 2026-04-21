@@ -216,13 +216,13 @@ For each erosion/deposition polygon, the following features are extracted:
 
 The analysis identifies significant elevation changes across the Gisborne region:
 
-![Example elevation change visualization would go here]
+![Elevation change visualization showing erosion and deposition patterns](elevation_change_example.png)
 
 ### Clustering Results
 
 K-means clustering groups similar erosion/deposition patterns:
 
-![Example clustering visualization would go here]
+![Clustering visualization showing k-means results with 25 clusters](clustering_example.png)
 
 ### Interactive Maps
 
