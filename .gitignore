@@ -1,6 +1,12 @@
-*.tif
 tile_results/
+wbt_outputs/
 lcdb-v50-land-cover-database-version-50-mainland-new-zealand.gpkg
 nzRec2_v5.gdb/
 clusters.gpkg
 .private-key.json
+data/*.gpkg
+data/areas_split.parquet
+*.gdb/
+__pycache__/
+*.pyc
+*.pyo
