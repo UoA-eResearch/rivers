@@ -1,0 +1,45 @@
+name: Process Rivers Data
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run monthly on the 1st at 00:00 UTC
+    - cron: '0 0 1 * *'
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480  # 8 hours timeout
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Run batch processing
+      run: |
+        python src/batch.py
+
+    - name: Run clustering notebook
+      run: |
+        jupyter nbconvert --to notebook --execute notebooks/clustering.ipynb --output clustering.ipynb
+
+    - name: Upload results
+      uses: actions/upload-artifact@v3
+      with:
+        name: processed-data
+        path: |
+          data/areas.parquet
+          data/areas+NDVI.parquet
+          data/clusters.parquet
+          data/clusters.gpkg
+          notebooks/clustering.ipynb
+        retention-days: 90
