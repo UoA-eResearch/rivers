@@ -1,5 +1,7 @@
 # Rivers - Erosion and Sedimentation Analysis for Gisborne, New Zealand
 
+[![Process Rivers Data](https://github.com/UoA-eResearch/rivers/actions/workflows/process-data.yml/badge.svg)](https://github.com/UoA-eResearch/rivers/actions/workflows/process-data.yml)
+
 This repository contains code and data for analyzing erosion and sedimentation patterns in the Gisborne region of New Zealand using Digital Elevation Model (DEM) data from 2018-2020 and 2023, along with NDVI (Normalized Difference Vegetation Index) satellite imagery.
 
 ## Table of Contents
