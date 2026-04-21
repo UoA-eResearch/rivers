@@ -8,3 +8,6 @@ data/*.tif
 data/*.gpkg
 data/areas_split.parquet
 *.gdb/
+__pycache__/
+*.pyc
+*.pyo
