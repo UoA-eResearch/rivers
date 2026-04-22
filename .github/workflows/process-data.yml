@@ -2,6 +2,12 @@ name: Process Rivers Data
 
 on:
   workflow_dispatch:
+    inputs:
+      load_areas_from_file:
+        description: 'Load data/areas.parquet instead of building from scratch'
+        required: false
+        type: boolean
+        default: false
   schedule:
     # Run monthly on the 1st at 00:00 UTC
     - cron: '0 0 1 * *'
@@ -28,7 +34,11 @@ jobs:
 
     - name: Run batch processing
       run: |
-        python src/batch.py
+        if [ "${{ github.event.inputs.load_areas_from_file }}" = "false" ] || [ -z "${{ github.event.inputs.load_areas_from_file }}" ]; then
+          python src/batch.py --force-rebuild
+        else
+          python src/batch.py
+        fi
 
     - name: Run clustering notebook
       run: |

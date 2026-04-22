@@ -14,6 +14,7 @@ import time
 import pandas as pd
 from glob import glob
 import whitebox
+import argparse
 tqdm.pandas()
 
 # Configuration
@@ -455,15 +456,23 @@ def process_tiles(REC, all_streams, LCDB, river_polygons):
             continue
 
 
-def main():
-    """Main processing pipeline."""
+def main(force_rebuild=False):
+    """
+    Main processing pipeline.
+
+    Args:
+        force_rebuild: If True, rebuild areas.parquet from scratch even if it exists.
+                      If False, load existing areas.parquet if available.
+    """
     print("Starting batch processing...")
 
     # Load global datasets
     REC, all_streams, LCDB, river_polygons = load_global_data()
 
     # Process tiles if needed
-    if not os.path.exists(f"{OUTPUT_DIR}/areas.parquet"):
+    if force_rebuild or not os.path.exists(f"{OUTPUT_DIR}/areas.parquet"):
+        if force_rebuild and os.path.exists(f"{OUTPUT_DIR}/areas.parquet"):
+            print(f"\nForce rebuild requested - ignoring existing {OUTPUT_DIR}/areas.parquet")
         print("\nProcessing DEM tiles...")
         process_tiles(REC, all_streams, LCDB, river_polygons)
 
@@ -483,4 +492,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Process river data from DEM tiles.')
+    parser.add_argument('--force-rebuild', action='store_true',
+                       help='Force rebuild of areas.parquet from scratch (default: load existing if available)')
+    args = parser.parse_args()
+    main(force_rebuild=args.force_rebuild)
