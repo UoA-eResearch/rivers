@@ -10,3 +10,9 @@ data/areas_split.parquet
 __pycache__/
 *.pyc
 *.pyo
+prepared/
+data/areas+NDVI.parquet
+# Extracted from the data/ archives
+/nz-river-polygons-topo-150k.*
+/README.TXT
+/rec2_attribute_definitions.xlsx
