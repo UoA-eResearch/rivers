@@ -1,499 +1,878 @@
 #!/usr/bin/env python3
+"""Feature extraction for areas of elevation change in the Gisborne 1 m DEMs.
 
-import rasterio
-import requests
-from rasterio.features import shapes, sieve, rasterize
-import geopandas as gpd
-import os
-import numpy as np
-from tqdm.auto import tqdm
-from shapely.geometry import shape, MultiPolygon, Polygon
-from rasterio.mask import mask
-import xdem
-import time
-import pandas as pd
-from glob import glob
-import whitebox
+The pipeline has three stages, which can be run together (the default) or
+separately so that the tile stage can be spread over several machines:
+
+``prepare``
+    Index the DEM tiles of both epochs (2018-2020 and 2023), write a GDAL VRT
+    for each epoch, and clip REC2 streams, LCDB land cover and LINZ river
+    polygons to the study region (written to ``prepared/``).
+``tiles``
+    For each DEM tile: detect polygons of elevation change, split them at river
+    polygon boundaries, then compute per-polygon features (elevation, terrain,
+    hydrological and land-cover attributes). One GeoParquet file per tile is
+    written to ``tile_results/``.
+``finalize``
+    Join the tile results into ``data/areas.parquet`` and add NDVI features
+    (``data/areas+NDVI.parquet``).
+
+Usage::
+
+    python src/batch.py                         # all stages
+    python src/batch.py --force-rebuild         # rebuild areas.parquet even if it exists
+    python src/batch.py --stage tiles --shard 0 --num-shards 20
+    python src/batch.py --stage tiles --tiles BD44_10000_0503
+"""
+
 import argparse
+import math
+import os
+import shutil
+import sys
+import time
+import traceback
+import warnings
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from glob import glob
+
+# GDAL settings for reading cloud-optimised GeoTIFFs over HTTP. Set as
+# environment variables so they also apply in worker threads.
+for _key, _value in {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tiff,.tif,.vrt",
+    "GDAL_HTTP_MAX_RETRY": "5",
+    "GDAL_HTTP_RETRY_DELAY": "2",
+    "VSI_CACHE": "TRUE",
+}.items():
+    os.environ.setdefault(_key, _value)
+
+import geopandas as gpd  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import rasterio  # noqa: E402
+import requests  # noqa: E402
+import whitebox  # noqa: E402
+import xdem  # noqa: E402
+from rasterio.features import rasterize, shapes, sieve  # noqa: E402
+from rasterio.mask import mask  # noqa: E402
+from rasterio.transform import from_origin  # noqa: E402
+from rasterio.windows import Window  # noqa: E402
+from scipy import ndimage  # noqa: E402
+from shapely.geometry import box, shape  # noqa: E402
+from tqdm.auto import tqdm  # noqa: E402
+
 tqdm.pandas()
 
+# ---------------------------------------------------------------------------
 # Configuration
+# ---------------------------------------------------------------------------
 DATA_DIR = "data"
-TILE_RESULTS_DIR = "tile_results"
 OUTPUT_DIR = "data"
+TILE_RESULTS_DIR = "tile_results"
+PREPARED_DIR = "prepared"
 WBT_DIR = "wbt_outputs"
 
-def load_global_data():
-    """Load global datasets needed for feature extraction."""
-    start = time.time()
-    print("Loading REC2 and LCDB datasets...")
+DEM_COLLECTIONS = {
+    "old": "https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2018-2020/dem_1m/2193",
+    "new": "https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2023/dem_1m/2193",
+}
+CRS = "EPSG:2193"
 
-    # Extract REC2 if needed
-    if not os.path.exists("nzRec2_v5.gdb"):
-        import zipfile
-        print("Extracting REC2_geodata_version_5.zip...")
-        with zipfile.ZipFile(f"{DATA_DIR}/REC2_geodata_version_5.zip", 'r') as zip_ref:
-            zip_ref.extractall(".")
+REC_ZIP = f"{DATA_DIR}/REC2_geodata_version_5.zip"
+REC_GDB = "nzRec2_v5.gdb"
+LCDB_ZIP = f"{DATA_DIR}/lris-lcdb-v50-land-cover-database-version-50-mainland-new-zealand-GPKG.zip"
+LCDB_GPKG = "lcdb-v50-land-cover-database-version-50-mainland-new-zealand.gpkg"
+RIVERS_ZIP = f"{DATA_DIR}/lds-nz-river-polygons-topo-150k-GPKG.zip"
+RIVERS_GPKG = "nz-river-polygons-topo-150k.gpkg"
+LCDB_COLUMNS = ["Class_2018", "Wetland_18", "Onshore_18"]
 
-    # Extract LCDB if needed
-    if not os.path.exists("lcdb-v50-land-cover-database-version-50-mainland-new-zealand.gpkg"):
-        import zipfile
-        print("Extracting LCDB zip...")
-        with zipfile.ZipFile(f"{DATA_DIR}/lris-lcdb-v50-land-cover-database-version-50-mainland-new-zealand-GPKG.zip", 'r') as zip_ref:
-            zip_ref.extractall(".")
+# Change detection
+MIN_AREA = 4000  # m^2; minimum polygon area, also the sieve size (in 1 m pixels)
+STATS = ("min", "max", "mean", "median", "std")
 
-    REC = gpd.read_file("nzRec2_v5.gdb", engine='pyogrio', use_arrow=True)
-    all_streams = REC.union_all()
-    LCDB = gpd.read_file("lcdb-v50-land-cover-database-version-50-mainland-new-zealand.gpkg", engine='pyogrio', use_arrow=True)
+# Terrain attributes (xdem), computed for the old DEM, new DEM and their difference
+TERRAIN_ATTRIBUTES = [
+    "roughness", "slope", "aspect", "curvature", "terrain_ruggedness_index",
+    "rugosity", "profile_curvature", "planform_curvature",
+]
+TERRAIN_MARGIN = 3  # pixels read around each tile so moving-window attributes have no edge NaNs
 
-    # Load river polygons if needed
-    river_polygons = None
-    if os.path.exists(f"{DATA_DIR}/lds-nz-river-polygons-topo-150k-GPKG.zip"):
-        import zipfile
-        if not os.path.exists("nz-river-polygons-topo-150k.gpkg"):
-            print("Extracting river polygons...")
-            with zipfile.ZipFile(f"{DATA_DIR}/lds-nz-river-polygons-topo-150k-GPKG.zip", 'r') as zip_ref:
-                zip_ref.extractall(".")
-        # Find the actual gpkg file
-        gpkg_files = glob("*.gpkg")
-        river_gpkg = [f for f in gpkg_files if "river" in f.lower()]
-        if river_gpkg:
-            river_polygons = gpd.read_file(river_gpkg[0], engine='pyogrio', use_arrow=True)
-            print(f"Loaded river polygons from {river_gpkg[0]}")
+# Hydrology (WhiteboxTools)
+HYDRO_EPOCH = "old"  # DEM used for flow routing: the pre-change (2018-2020) terrain
+HYDRO_BUFFER = 500  # m of neighbouring tiles loaded so flow paths are not cut at tile edges
+STREAM_MIN_CATCHMENT = 1e4  # m^2; D8 contributing area for a DEM cell to count as a channel
+STREAM_SNAP_DISTANCE = 50  # m; DEM channels within this distance of a REC2 line are streams
+COAST_MAX_ELEVATION = 5  # m; DEM cells this low next to NoData (the sea) count as shoreline
+SEA_MAX_ELEVATION = 0  # m; areas this low connected to NoData are sea (some DEMs have a flattened sea surface)
+HYDRO_FEATURES = [
+    "downslope_dist", "elevation_above_stream", "depth_to_water",
+    "twi", "spi", "connectivity_index",
+]
+NODATA = -9999.0
 
-    print(f"Loaded in {time.time() - start:.2f} seconds")
-    return REC, all_streams, LCDB, river_polygons
+# Borselli et al. (2008) connectivity index. The weighting factor W is the
+# RUSLE cover-management factor (C) of the LCDB 2018 land-cover class. Values
+# are indicative, loosely based on published C-factor ranges for comparable
+# land covers (e.g. Panagos et al. 2015); adjust them for your own study.
+# Sealed surfaces are given a moderate value because they transmit runoff
+# and sediment efficiently even though they do not erode, and open water is
+# given 1 (no impedance).
+LCDB_C_FACTOR = {
+    1: 0.1,     # Built-up Area (settlement)
+    2: 0.05,    # Urban Parkland/Open Space
+    5: 0.1,     # Transport Infrastructure
+    6: 0.5,     # Surface Mine or Dump
+    10: 0.5,    # Sand or Gravel
+    12: 0.5,    # Landslide
+    14: 0.001,  # Permanent Snow and Ice
+    15: 0.04,   # Alpine Grass/Herbfield
+    16: 0.1,    # Gravel or Rock
+    20: 1.0,    # Lake or Pond
+    21: 1.0,    # River
+    22: 1.0,    # Estuarine Open Water
+    30: 0.25,   # Short-rotation Cropland
+    33: 0.2,    # Orchard, Vineyard or Other Perennial Crop
+    40: 0.05,   # High Producing Exotic Grassland
+    41: 0.08,   # Low Producing Grassland
+    43: 0.03,   # Tall Tussock Grassland
+    44: 0.2,    # Depleted Grassland
+    45: 0.01,   # Herbaceous Freshwater Vegetation
+    46: 0.01,   # Herbaceous Saline Vegetation
+    47: 0.02,   # Flaxland
+    50: 0.02,   # Fernland
+    51: 0.02,   # Gorse and/or Broom
+    52: 0.01,   # Manuka and/or Kanuka
+    54: 0.005,  # Broadleaved Indigenous Hardwoods
+    55: 0.02,   # Sub Alpine Shrubland
+    56: 0.02,   # Mixed Exotic Shrubland
+    58: 0.03,   # Matagouri or Grey Scrub
+    64: 0.15,   # Forest - Harvested
+    68: 0.003,  # Deciduous Hardwoods
+    69: 0.001,  # Indigenous Forest
+    70: 0.001,  # Mangrove
+    71: 0.003,  # Exotic Forest
+}
+DEFAULT_C_FACTOR = 0.05  # cells not covered by LCDB
+IC_SLOPE_BOUNDS = (0.005, 1.0)  # m/m; slope limits for the IC (Cavalli et al. 2013)
+
+# WhiteboxTools D8 pointer codes -> (row, col) offsets
+D8_OFFSETS = {
+    1: (-1, 1), 2: (0, 1), 4: (1, 1), 8: (1, 0),
+    16: (1, -1), 32: (0, -1), 64: (-1, -1), 128: (-1, 0),
+}
 
 
-def compute_hydrological_indices(dem_path, streams_path, tilename):
-    """Compute hydrological indices using WhiteboxTools.
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+def extract(zip_path, member):
+    """Extract ``zip_path`` into the working directory unless ``member`` exists."""
+    if not os.path.exists(member):
+        print(f"Extracting {zip_path}...")
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(".")
+    return member
 
-    Parameters
-    ----------
-    dem_path : str
-        Path to local DEM raster file.
-    streams_path : str
-        Path to streams vector file (e.g. GeoPackage).
-    tilename : str
-        Tile identifier used to name output files.
 
-    Returns
-    -------
-    tuple of rasterio.DatasetReader or None
-        Opened datasets for (downslope_dist, elev_above_stream, depth_to_water).
+def grid_bounds(array_shape, transform):
+    """(left, bottom, right, top) of a north-up raster grid."""
+    left, top = transform.c, transform.f
+    return (left, top + array_shape[0] * transform.e, left + array_shape[1] * transform.a, top)
+
+
+def expand(bounds, distance):
+    left, bottom, right, top = bounds
+    return (left - distance, bottom - distance, right + distance, top + distance)
+
+
+def write_raster(path, array, transform, nodata=NODATA):
+    """Write a float32 GeoTIFF that WhiteboxTools can read (uncompressed)."""
+    array = np.where(np.isfinite(array), array, nodata).astype("float32")
+    profile = dict(driver="GTiff", width=array.shape[1], height=array.shape[0], count=1,
+                   dtype="float32", crs=CRS, transform=transform, nodata=nodata)
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(array, 1)
+
+
+def read_raster(path):
+    """Read band 1 as float32 with NoData converted to NaN."""
+    with rasterio.open(path) as src:
+        return src.read(1, masked=True).astype("float32").filled(np.nan)
+
+
+_WBT = None
+
+
+def wbt(tool, **kwargs):
+    """Run a WhiteboxTools tool and raise if it did not produce its output.
+
+    The ``whitebox`` Python wrapper returns 0 even when the tool fails, so
+    failures are detected by checking that the output file was written.
     """
-    wbt = whitebox.WhiteboxTools()
-    wbt.set_verbose_mode(False)
+    global _WBT
+    if _WBT is None:
+        _WBT = whitebox.WhiteboxTools()
+        _WBT.set_verbose_mode(True)  # messages go to the callback below, not stdout
+        _WBT.set_compress_rasters(False)
+    output = kwargs.get("output") or kwargs.get("out_accum")
+    if os.path.exists(output):
+        os.remove(output)
+    messages = []
+    getattr(_WBT, tool)(callback=messages.append, **kwargs)
+    if not os.path.exists(output):
+        raise RuntimeError(f"WhiteboxTools {tool} failed:\n" + "\n".join(messages[-15:]))
+    return output
 
-    os.makedirs(WBT_DIR, exist_ok=True)
 
-    # Output paths
-    streams_raster = f"{WBT_DIR}/{tilename}_streams.tif"
-    downslope_dist = f"{WBT_DIR}/{tilename}_downslope_dist.tif"
-    elev_above_stream = f"{WBT_DIR}/{tilename}_elev_above_stream.tif"
-    depth_to_water = f"{WBT_DIR}/{tilename}_depth_to_water.tif"
+class Zones:
+    """Per-polygon statistics of rasters, given a raster of polygon labels (1..n)."""
 
-    try:
-        # Rasterize streams to match DEM extent/resolution
-        if not os.path.exists(streams_raster):
-            wbt.rasterize_streams(
-                streams=streams_path,
-                base=dem_path,
-                output=streams_raster
-            )
+    def __init__(self, labels, n):
+        self.n = n
+        self.index = np.flatnonzero(labels)
+        self.labels = labels.ravel()[self.index].astype(np.int64)
 
-        # DownslopeDistanceToStream
-        if not os.path.exists(downslope_dist):
-            wbt.downslope_distance_to_stream(
-                dem=dem_path,
-                streams=streams_raster,
-                output=downslope_dist
-            )
+    def stats(self, values, prefix):
+        out = {f"{prefix}_{s}": np.full(self.n, np.nan) for s in STATS}
+        vals = values.ravel()[self.index].astype(np.float64)
+        ok = np.isfinite(vals)
+        vals, labs = vals[ok], self.labels[ok]
+        if vals.size == 0:
+            return out
+        order = np.lexsort((vals, labs))
+        vals, labs = vals[order], labs[order]
+        counts = np.bincount(labs, minlength=self.n + 1)[1:]
+        has = counts > 0
+        ends = np.cumsum(counts)
+        starts = ends - counts
+        mean = np.bincount(labs, weights=vals, minlength=self.n + 1)[1:] / np.maximum(counts, 1)
+        dev = vals - mean[labs - 1]
+        var = np.bincount(labs, weights=dev * dev, minlength=self.n + 1)[1:] / np.maximum(counts, 1)
+        c, s = counts[has], starts[has]
+        out[f"{prefix}_min"][has] = vals[s]
+        out[f"{prefix}_max"][has] = vals[s + c - 1]
+        out[f"{prefix}_mean"][has] = mean[has]
+        out[f"{prefix}_median"][has] = (vals[s + (c - 1) // 2] + vals[s + c // 2]) / 2
+        out[f"{prefix}_std"][has] = np.sqrt(var[has])
+        return out
 
-        # ElevationAboveStreamEuclidean
-        if not os.path.exists(elev_above_stream):
-            wbt.elevation_above_stream_euclidean(
-                dem=dem_path,
-                streams=streams_raster,
-                output=elev_above_stream
-            )
 
-        # DepthToWater
-        if not os.path.exists(depth_to_water):
-            wbt.depth_to_water(
-                dem=dem_path,
-                output=depth_to_water
-            )
+# ---------------------------------------------------------------------------
+# Stage 1: prepare
+# ---------------------------------------------------------------------------
+def list_tiles(epoch):
+    url = DEM_COLLECTIONS[epoch]
+    links = requests.get(f"{url}/collection.json", timeout=60).json()["links"]
+    return sorted(link["href"].replace(".json", "").strip("./") for link in links if link["rel"] == "item")
 
-        return (
-            rasterio.open(downslope_dist) if os.path.exists(downslope_dist) else None,
-            rasterio.open(elev_above_stream) if os.path.exists(elev_above_stream) else None,
-            rasterio.open(depth_to_water) if os.path.exists(depth_to_water) else None,
+
+def build_tile_index(epoch):
+    """Read the header of every DEM tile of an epoch to get its exact grid."""
+    url = DEM_COLLECTIONS[epoch]
+
+    def info(name):
+        with rasterio.open(f"{url}/{name}.tiff") as src:
+            b = src.bounds
+            return dict(tile=name, url=f"{url}/{name}.tiff", left=b.left, bottom=b.bottom,
+                        right=b.right, top=b.top, width=src.width, height=src.height,
+                        res=src.res[0], nodata=src.nodata)
+
+    names = list_tiles(epoch)
+    with ThreadPoolExecutor(16) as ex:
+        rows = list(tqdm(ex.map(info, names), total=len(names), desc=f"Indexing {epoch} DEM tiles"))
+    return pd.DataFrame(rows)
+
+
+def write_vrt(index, path):
+    """Mosaic all tiles of an epoch into one VRT so any window can be read."""
+    res = float(index.res.iloc[0])
+    nodata = index.nodata.iloc[0]
+    minx, maxy = index.left.min(), index.top.max()
+    width = int(round((index.right.max() - minx) / res))
+    height = int(round((maxy - index.bottom.min()) / res))
+    sources = []
+    for t in index.itertuples():
+        xoff = int(round((t.left - minx) / res))
+        yoff = int(round((maxy - t.top) / res))
+        sources.append(
+            f'<ComplexSource><SourceFilename relativeToVRT="0">/vsicurl/{t.url}</SourceFilename>'
+            f'<SourceBand>1</SourceBand>'
+            f'<SourceProperties RasterXSize="{t.width}" RasterYSize="{t.height}" DataType="Float32" '
+            f'BlockXSize="512" BlockYSize="512"/>'
+            f'<SrcRect xOff="0" yOff="0" xSize="{t.width}" ySize="{t.height}"/>'
+            f'<DstRect xOff="{xoff}" yOff="{yoff}" xSize="{t.width}" ySize="{t.height}"/>'
+            f'<NODATA>{nodata}</NODATA></ComplexSource>'
         )
-    except Exception as e:
-        print(f"WhiteboxTools error: {e}")
-        return None, None, None
+    xml = (
+        f'<VRTDataset rasterXSize="{width}" rasterYSize="{height}">'
+        f'<SRS>{CRS}</SRS><GeoTransform>{minx}, {res}, 0, {maxy}, 0, {-res}</GeoTransform>'
+        f'<VRTRasterBand dataType="Float32" band="1"><NoDataValue>{nodata}</NoDataValue>'
+        + "\n".join(sources)
+        + "</VRTRasterBand></VRTDataset>"
+    )
+    with open(path, "w") as f:
+        f.write(xml)
+
+
+def prepare(force=False):
+    """Build the tile indexes/VRTs and region-clipped reference layers."""
+    os.makedirs(PREPARED_DIR, exist_ok=True)
+    indexes = {}
+    for epoch in DEM_COLLECTIONS:
+        index_path = f"{PREPARED_DIR}/tiles_{epoch}.csv"
+        if force or not os.path.exists(index_path):
+            build_tile_index(epoch).to_csv(index_path, index=False)
+        indexes[epoch] = pd.read_csv(index_path)
+        write_vrt(indexes[epoch], f"{PREPARED_DIR}/dem_{epoch}.vrt")
+
+    tiles = pd.concat(indexes.values())
+    region = expand((tiles.left.min(), tiles.bottom.min(), tiles.right.max(), tiles.top.max()),
+                    HYDRO_BUFFER + STREAM_SNAP_DISTANCE + 1000)
+
+    layers = {
+        "rec2": (REC_ZIP, REC_GDB, dict(layer="riverlines", columns=["nzsegment", "StreamOrde", "CUM_AREA"])),
+        "lcdb": (LCDB_ZIP, LCDB_GPKG, dict(columns=LCDB_COLUMNS)),
+        "river_polygons": (RIVERS_ZIP, RIVERS_GPKG, dict(columns=[])),
+    }
+    for name, (zip_path, member, kwargs) in layers.items():
+        out_path = f"{PREPARED_DIR}/{name}.parquet"
+        if os.path.exists(out_path) and not force:
+            continue
+        if not os.path.exists(zip_path):
+            print(f"{zip_path} not found, skipping {name}")
+            continue
+        start = time.time()
+        gdf = gpd.read_file(extract(zip_path, member), bbox=region, engine="pyogrio", **kwargs)
+        gdf = gdf.to_crs(CRS)
+        gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()]
+        gdf["geometry"] = gdf.geometry.make_valid()
+        gdf.to_parquet(out_path)
+        print(f"Prepared {name}: {len(gdf)} features in {time.time() - start:.1f}s")
+
+
+def load_references():
+    refs = {}
+    for name in ("rec2", "lcdb", "river_polygons"):
+        path = f"{PREPARED_DIR}/{name}.parquet"
+        refs[name] = gpd.read_parquet(path) if os.path.exists(path) else None
+        if refs[name] is None:
+            print(f"Warning: {path} not found; features depending on it will be missing")
+    if refs["lcdb"] is not None:
+        refs["lcdb"]["c_factor"] = (
+            pd.to_numeric(refs["lcdb"]["Class_2018"], errors="coerce").map(LCDB_C_FACTOR).fillna(DEFAULT_C_FACTOR)
+        )
+    for epoch in DEM_COLLECTIONS:
+        refs[f"tiles_{epoch}"] = pd.read_csv(f"{PREPARED_DIR}/tiles_{epoch}.csv").set_index("tile")
+        refs[f"vrt_{epoch}"] = f"{PREPARED_DIR}/dem_{epoch}.vrt"
+    return refs
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: tiles
+# ---------------------------------------------------------------------------
+def read_dem_window(vrt_path, bounds, res):
+    """Read a window of a DEM mosaic; cells outside the data are NaN."""
+    with rasterio.open(vrt_path) as src:
+        col = int(round((bounds[0] - src.transform.c) / res))
+        row = int(round((src.transform.f - bounds[3]) / res))
+        width = int(round((bounds[2] - bounds[0]) / res))
+        height = int(round((bounds[3] - bounds[1]) / res))
+        window = Window(col, row, width, height)
+        data = src.read(1, window=window, boundless=True, masked=True)
+    transform = from_origin(bounds[0], bounds[3], res, res)
+    return data.astype("float32").filled(np.nan), transform
+
+
+def detect_change_polygons(diff, transform, res):
+    """Polygons where the DEM difference rounds to a non-zero number of metres."""
+    change = np.nan_to_num(diff, nan=0.0).round().clip(-1, 1).astype(np.int16)
+    change = sieve(change, int(MIN_AREA / res ** 2))
+    geoms = [shape(s) for s, _ in shapes(change, mask=change != 0, transform=transform)]
+    areas = gpd.GeoDataFrame(geometry=geoms, crs=CRS)
+    areas["area"] = areas.area
+    # Sieving should already have removed small regions, but a few slip through.
+    areas = areas[areas.area > MIN_AREA]
+    return areas.sort_values("area", ascending=False).reset_index(drop=True)
 
 
 def split_by_river_polygons(areas, river_polygons):
-    """Split polygons based on river polygon boundaries."""
-    if river_polygons is None:
-        print("No river polygons available, skipping split")
+    """Split change polygons at river polygon boundaries.
+
+    Both the parts inside and outside river polygons are kept (``in_river``
+    tells them apart); ``split_by_river`` is True for parts of polygons that
+    straddled a river boundary. Parts smaller than ``MIN_AREA`` are dropped.
+    """
+    areas = areas.copy()
+    areas["in_river"] = False
+    areas["split_by_river"] = False
+    if river_polygons is None or areas.empty:
         return areas
+    candidates = river_polygons.iloc[
+        river_polygons.sindex.query(box(*areas.total_bounds), predicate="intersects")
+    ]
+    if candidates.empty:
+        return areas
+    rivers = candidates.union_all()
+    inside = areas.geometry.intersection(rivers)
+    outside = areas.geometry.difference(rivers)
+    straddles = (inside.area > 0) & (outside.area > 0)
 
-    print("Splitting polygons by river boundaries...")
-    split_areas = []
-    river_sindex = river_polygons.sindex
-
-    for idx, row in tqdm(areas.iterrows(), total=len(areas), desc="Splitting polygons"):
-        geom = row.geometry
-
-        # Use spatial index to preselect candidate river polygons
-        candidate_idx = river_sindex.query(geom, predicate="intersects")
-        if len(candidate_idx) == 0:
-            intersecting_rivers = river_polygons.iloc[0:0]
-        else:
-            intersecting_rivers = river_polygons.iloc[candidate_idx]
-
-        if len(intersecting_rivers) == 0:
-            # No intersection, keep original
-            row_copy = row.copy()
-            row_copy['split_by_river'] = False
-            split_areas.append(row_copy)
-        else:
-            # Split by river polygons
-            try:
-                # Create difference with all intersecting rivers
-                remaining = geom
-                for _, river in intersecting_rivers.iterrows():
-                    remaining = remaining.difference(river.geometry)
-
-                # Add the split parts
-                if not remaining.is_empty:
-                    if isinstance(remaining, MultiPolygon):
-                        for poly in remaining.geoms:
-                            if poly.area > 4000:  # Keep minimum area threshold
-                                new_row = row.copy()
-                                new_row.geometry = poly
-                                new_row['area'] = poly.area
-                                new_row['split_by_river'] = True
-                                split_areas.append(new_row)
-                    elif isinstance(remaining, Polygon) and remaining.area > 4000:
-                        new_row = row.copy()
-                        new_row.geometry = remaining
-                        new_row['area'] = remaining.area
-                        new_row['split_by_river'] = True
-                        split_areas.append(new_row)
-            except Exception as e:
-                # If splitting fails, keep original
-                print(f"Failed to split polygon {idx}: {e}")
-                row_copy = row.copy()
-                row_copy['split_by_river'] = False
-                split_areas.append(row_copy)
-
-    result = gpd.GeoDataFrame(split_areas, crs=areas.crs)
-    print(f"Split {len(areas)} polygons into {len(result)} polygons")
-    return result
+    parts = []
+    for in_river, geoms in ((True, inside), (False, outside)):
+        part = areas.copy()
+        part["geometry"] = geoms
+        part["in_river"] = in_river
+        part["split_by_river"] = straddles
+        parts.append(part)
+    result = pd.concat(parts).explode(index_parts=False)
+    result = result[result.geom_type == "Polygon"]
+    result["area"] = result.area
+    result = result[result.area > MIN_AREA]
+    result = gpd.GeoDataFrame(result, geometry="geometry", crs=areas.crs)
+    return result.sort_values("area", ascending=False).reset_index(drop=True)
 
 
-def get_features(row, old, new, diff, result, all_streams, LCDB, hydro_rasters=None):
-    """Extract features for a single polygon."""
-    geom = row.geometry
-    masked_old, transform = mask(old, [geom], nodata=np.nan)
-    nonan = np.argwhere(~np.isnan(masked_old[0]))
+def stream_mask(dem, transform, refs, workdir, acc):
+    """Stream/water cells: REC2 streams snapped to DEM channels, river polygons and the shoreline.
 
-    if nonan.size == 0:
-        masked_old = np.array([[np.nan]])
-        masked_new = np.array([[np.nan]])
-        masked_diff = np.array([[np.nan]])
+    REC2 lines are offset from the channels in the 1 m lidar DEM (median ~10 m
+    in testing), so the REC2 lines are rasterised with ``RasterizeStreams`` and
+    then replaced by the DEM channel cells (D8 contributing area of at least
+    ``STREAM_MIN_CATCHMENT``) that lie within ``STREAM_SNAP_DISTANCE`` of them.
+    The sea is NoData in the DEMs, or a flattened surface just below 0 m
+    between the shore and NoData, so low-lying cells next to NoData and low
+    areas connected to it are added as sea; otherwise land draining straight
+    to the sea has no target.
+    """
+    res = transform.a
+    bounds = grid_bounds(dem.shape, transform)
+    water = np.zeros(dem.shape, dtype=bool)
+
+    rec = refs["rec2"]
+    if rec is not None:
+        rec = rec.iloc[rec.sindex.query(box(*bounds), predicate="intersects")]
+    if rec is not None and not rec.empty:
+        shp = os.path.join(workdir, "rec2.shp")
+        rec[["geometry"]].explode(index_parts=False).to_file(shp)
+        wbt("rasterize_streams", streams=shp, base=os.path.join(workdir, "dem.tif"),
+            output=os.path.join(workdir, "rec2.tif"), nodata=False)
+        wbt("euclidean_distance", i=os.path.join(workdir, "rec2.tif"),
+            output=os.path.join(workdir, "rec2_distance.tif"))
+        near_rec = read_raster(os.path.join(workdir, "rec2_distance.tif")) <= STREAM_SNAP_DISTANCE
+        water |= near_rec & (acc * res * res >= STREAM_MIN_CATCHMENT)
+
+    rivers = refs["river_polygons"]
+    if rivers is not None:
+        rivers = rivers.iloc[rivers.sindex.query(box(*bounds), predicate="intersects")]
+        if not rivers.empty:
+            water |= rasterize(rivers.geometry, out_shape=dem.shape, transform=transform,
+                               fill=0, default_value=1, dtype="uint8").astype(bool)
+
+    nodata = ~np.isfinite(dem)
+    if nodata.any():
+        eight = np.ones((3, 3), dtype=bool)
+        shore = ndimage.binary_dilation(nodata, structure=eight) & ~nodata
+        with np.errstate(invalid="ignore"):
+            water |= shore & (dem <= COAST_MAX_ELEVATION)
+            low = dem <= SEA_MAX_ELEVATION
+        regions, n = ndimage.label(low, structure=eight)
+        is_sea = np.zeros(n + 1, dtype=bool)
+        is_sea[regions[shore & low]] = True
+        is_sea[0] = False
+        water |= is_sea[regions]
+    return water & ~nodata
+
+
+def index_dtype(n):
+    return np.int32 if n < 2 ** 31 else np.int64
+
+
+def d8_receivers(pointer, valid, res):
+    """Flat index of each cell's D8 receiver (-1 if none) and its flow step length."""
+    nrows, ncols = pointer.shape
+    receivers = np.full(pointer.size, -1, dtype=index_dtype(pointer.size))
+    step = np.full(pointer.size, res, dtype=np.float32)
+    for code, (dr, dc) in D8_OFFSETS.items():
+        r, c = np.nonzero(pointer == code)
+        rr, cc = r + dr, c + dc
+        ok = (rr >= 0) & (rr < nrows) & (cc >= 0) & (cc < ncols)
+        r, c, rr, cc = r[ok], c[ok], rr[ok], cc[ok]
+        ok = valid[rr, cc]
+        src = r[ok] * ncols + c[ok]
+        receivers[src] = rr[ok] * ncols + cc[ok]
+        if dr and dc:
+            step[src] = res * math.sqrt(2)
+    return receivers, step
+
+
+def downstream_sum(receivers, cost, target):
+    """Sum ``cost`` along each cell's D8 flow path, stopping at the first target cell.
+
+    Returns the sum including the starting cell and the target cell's own cost
+    (so targets get their own cost), or NaN where the flow path leaves the grid
+    or ends in a pit before reaching a target. Uses pointer jumping, so it
+    needs only O(log path length) vectorised passes.
+    """
+    dtype = index_dtype(receivers.size)
+    nxt = np.where(target, -1, receivers).astype(dtype)
+    total = cost.astype(np.float64)
+    end = np.arange(receivers.size, dtype=dtype)
+    active = np.flatnonzero(nxt >= 0).astype(dtype)
+    for _ in range(64):
+        if active.size == 0:
+            break
+        jump = nxt[active]
+        total[active] += total[jump]
+        end[active] = end[jump]
+        nxt[active] = nxt[jump]
+        active = active[nxt[active] >= 0]
     else:
-        top_left = nonan.min(axis=0)
-        bottom_right = nonan.max(axis=0)
-        masked_old = masked_old[0][top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
+        raise RuntimeError("D8 flow paths did not terminate (cycle in pointer raster?)")
+    return np.where(target[end], total, np.nan)
 
-        masked_new, transform = mask(new, [geom], nodata=np.nan)
-        masked_new = masked_new[0][top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
 
-        raster = rasterize([geom], out_shape=result.shape, transform=new.transform)
-        masked_diff = np.where(raster, diff, np.nan)
-        masked_diff = masked_diff[top_left[0]:bottom_right[0]+1, top_left[1]:bottom_right[1]+1]
+def connectivity_index(workdir, transform, slope_deg, water, c_factor, valid, crop):
+    """Borselli et al. (2008) index of sediment connectivity, IC = log10(D_up / D_dn).
 
-    row = row.to_dict()
-    row.update({
-        "old_min": np.nanmin(masked_old),
-        "old_max": np.nanmax(masked_old),
-        "old_mean": np.nanmean(masked_old),
-        "old_median": np.nanmedian(masked_old),
-        "old_std": np.nanstd(masked_old),
-        "new_min": np.nanmin(masked_new),
-        "new_max": np.nanmax(masked_new),
-        "new_mean": np.nanmean(masked_new),
-        "new_median": np.nanmedian(masked_new),
-        "new_std": np.nanstd(masked_new),
-        "diff_min": np.nanmin(masked_diff),
-        "diff_max": np.nanmax(masked_diff),
-        "diff_mean": np.nanmean(masked_diff),
-        "diff_median": np.nanmedian(masked_diff),
-        "diff_std": np.nanstd(masked_diff),
-        "distance_to_river": geom.distance(all_streams)
-    })
+    D_up = W_mean * S_mean * sqrt(A), with W_mean and S_mean averaged over the
+    D8 upslope contributing area A; D_dn = sum(d_i / (W_i * S_i)) along the D8
+    flow path to the nearest stream/water cell. W is the land-cover C-factor
+    and S the slope gradient (m/m), bounded as in Cavalli et al. (2013).
+    """
+    res = transform.a
+    p = lambda name: os.path.join(workdir, f"{name}.tif")  # noqa: E731
+    S = np.clip(np.tan(np.radians(slope_deg)), *IC_SLOPE_BOUNDS).astype("float32")
+    W = c_factor.astype("float32")
+    write_raster(p("ic_w"), np.where(valid, W, np.nan), transform)
+    write_raster(p("ic_s"), np.where(valid, S, np.nan), transform)
+    write_raster(p("ones"), np.where(valid, 1.0, np.nan), transform)
+    write_raster(p("zeros"), np.where(valid, 0.0, np.nan), transform)
+    for name in ("w", "s"):
+        wbt("d8_mass_flux", dem=p("dem_cond"), loading=p(f"ic_{name}"), efficiency=p("ones"),
+            absorption=p("zeros"), output=p(f"ic_sum_{name}"))
+    cells = read_raster(p("acc"))[crop]
+    w_mean = read_raster(p("ic_sum_w"))[crop] / cells
+    s_mean = read_raster(p("ic_sum_s"))[crop] / cells
+    d_up = w_mean * s_mean * np.sqrt(cells * res * res)
+    del w_mean, s_mean, cells
 
-    # Add hydrological indices from WhiteboxTools
-    if hydro_rasters is not None:
-        downslope_dist_raster, elev_above_stream_raster, depth_to_water_raster = hydro_rasters
+    receivers, step = d8_receivers(read_raster(p("d8")), valid, res)
+    cost = step / (W.ravel() * S.ravel())
+    del step, W, S
+    d_dn = downstream_sum(receivers, cost, water.ravel()).reshape(water.shape)[crop]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ic = np.log10(d_up / d_dn)
+    return np.where(valid[crop], ic, np.nan).astype("float32")
 
-        try:
-            if downslope_dist_raster is not None:
-                masked_downslope, _ = mask(downslope_dist_raster, [geom], nodata=np.nan, crop=True)
-                row.update({
-                    "downslope_dist_mean": np.nanmean(masked_downslope),
-                    "downslope_dist_median": np.nanmedian(masked_downslope),
-                    "downslope_dist_std": np.nanstd(masked_downslope),
-                })
 
-            if elev_above_stream_raster is not None:
-                masked_elev_stream, _ = mask(elev_above_stream_raster, [geom], nodata=np.nan, crop=True)
-                row.update({
-                    "elevation_above_stream_mean": np.nanmean(masked_elev_stream),
-                    "elevation_above_stream_median": np.nanmedian(masked_elev_stream),
-                    "elevation_above_stream_std": np.nanstd(masked_elev_stream),
-                })
+def compute_hydrology(dem, transform, refs, workdir, crop):
+    """Hydrological indices on a (buffered) DEM, using WhiteboxTools where possible.
 
-            if depth_to_water_raster is not None:
-                masked_depth, _ = mask(depth_to_water_raster, [geom], nodata=np.nan, crop=True)
-                row.update({
-                    "depth_to_water_mean": np.nanmean(masked_depth),
-                    "depth_to_water_median": np.nanmedian(masked_depth),
-                    "depth_to_water_std": np.nanstd(masked_depth),
-                })
-        except Exception as e:
-            print(f"Error processing hydrological indices: {e}")
+    Returns a dict of float32 arrays, cropped to ``crop`` (a pair of slices
+    selecting the tile from the buffered grid).
+    """
+    os.makedirs(workdir, exist_ok=True)
+    p = lambda name: os.path.join(workdir, f"{name}.tif")  # noqa: E731
+    valid = np.isfinite(dem)
+    write_raster(p("dem"), dem, transform)
 
-    lcdb_candidate_idx = LCDB.sindex.query(geom, predicate="intersects")
-    if len(lcdb_candidate_idx) > 0:
-        lcdb_candidates = LCDB.iloc[lcdb_candidate_idx]
-        lcdb_intersections = lcdb_candidates.intersects(geom)
-        if lcdb_intersections.any():
-            row.update(
-                lcdb_candidates.loc[
-                    lcdb_intersections, ["Class_2018", "Wetland_18", "Onshore_18"]
-                ].mode().iloc[0].replace({"no": False, "yes": True})
-            )
+    # Hydrologically condition the DEM (required by flow-routing tools).
+    # BreachDepressionsLeastCost was tried but took >5 minutes per tile on the
+    # flat Poverty Bay floodplain (and is non-deterministic when multi-threaded);
+    # BreachDepressions takes ~20 s, is deterministic and drains every cell.
+    wbt("breach_depressions", dem=p("dem"), output=p("dem_cond"), fill_pits=True)
+    wbt("d8_pointer", dem=p("dem_cond"), output=p("d8"))
+    wbt("d8_flow_accumulation", i=p("dem_cond"), output=p("acc"), out_type="cells")
+    wbt("d_inf_flow_accumulation", i=p("dem_cond"), output=p("sca"), out_type="sca")
+    wbt("slope", dem=p("dem"), output=p("slope"), units="degrees")
 
-    attribute_names = ["roughness", "slope", "aspect", "curvature", "terrain_ruggedness_index", "rugosity", "profile_curvature", "planform_curvature"]
-    diff_attributes = xdem.terrain.get_terrain_attribute(
-        masked_diff,
-        resolution=old.res,
-        attribute=attribute_names
+    # Topographic wetness index ln(SCA / tan(slope)) and stream power index SCA * tan(slope)
+    wbt("wetness_index", sca=p("sca"), slope=p("slope"), output=p("twi"))
+    wbt("stream_power_index", sca=p("sca"), slope=p("slope"), output=p("spi"))
+    out = {"twi": read_raster(p("twi"))[crop], "spi": read_raster(p("spi"))[crop]}
+
+    slope_deg = read_raster(p("slope"))
+    water = stream_mask(dem, transform, refs, workdir, read_raster(p("acc")))
+    if not water.any():
+        print("  no streams or river polygons near this tile; stream-based indices are NaN")
+        for name in ("downslope_dist", "elevation_above_stream", "depth_to_water", "connectivity_index"):
+            out[name] = np.full(out["twi"].shape, np.nan, dtype="float32")
+        return out
+    write_raster(p("water"), np.where(valid, water, np.nan), transform)
+
+    wbt("downslope_distance_to_stream", dem=p("dem_cond"), streams=p("water"), output=p("downslope_dist"))
+    wbt("elevation_above_stream_euclidean", dem=p("dem"), streams=p("water"), output=p("elevation_above_stream"))
+    out["downslope_dist"] = read_raster(p("downslope_dist"))[crop]
+    out["elevation_above_stream"] = read_raster(p("elevation_above_stream"))[crop]
+
+    # Cartographic depth-to-water (Murphy et al. 2009): least-cost accumulation of
+    # slope (m/m) x distance from the nearest water cell. WhiteboxTools' own
+    # DepthToWater tool is part of the paid extension, so CostDistance is used.
+    write_raster(p("tan_slope"), np.tan(np.radians(slope_deg)), transform)
+    wbt("cost_distance", source=p("water"), cost=p("tan_slope"), out_accum=p("depth_to_water"),
+        out_backlink=p("backlink"))
+    out["depth_to_water"] = read_raster(p("depth_to_water"))[crop]
+
+    c_factor = np.full(dem.shape, DEFAULT_C_FACTOR, dtype="float32")
+    lcdb = refs["lcdb"]
+    if lcdb is not None:
+        lcdb = lcdb.iloc[lcdb.sindex.query(box(*grid_bounds(dem.shape, transform)), predicate="intersects")]
+        if not lcdb.empty:
+            c_factor = rasterize(zip(lcdb.geometry, lcdb.c_factor), out_shape=dem.shape, transform=transform,
+                                 fill=DEFAULT_C_FACTOR, dtype="float32")
+    out["connectivity_index"] = connectivity_index(workdir, transform, slope_deg, water, c_factor, valid, crop)
+    return out
+
+
+def terrain_attribute(surface, attribute, res, needed, margin, block=128):
+    """An xdem terrain attribute, computed in blocks and only where ``needed``.
+
+    ``surface`` has ``margin`` extra cells on every side of the ``needed`` grid,
+    which must cover the attribute's moving window. Working in blocks bounds
+    memory (xdem's rugosity needs ~400 bytes per cell) and skips blocks without
+    polygons. Each attribute is requested on its own: when xdem 0.2 is given a
+    list of attributes it returns them in a different order from the request.
+    """
+    out = np.full(needed.shape, np.nan, dtype="float32")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for r0 in range(0, needed.shape[0], block):
+            for c0 in range(0, needed.shape[1], block):
+                r1, c1 = min(r0 + block, needed.shape[0]), min(c0 + block, needed.shape[1])
+                if not needed[r0:r1, c0:c1].any():
+                    continue
+                window = surface[r0:r1 + 2 * margin, c0:c1 + 2 * margin]
+                values = np.asarray(xdem.terrain.get_terrain_attribute(window, attribute=attribute, resolution=res))
+                out[r0:r1, c0:c1] = values[margin:margin + r1 - r0, margin:margin + c1 - c0]
+    return out
+
+
+def distance_to_river(areas, rec):
+    """Distance from each polygon to the nearest REC2 stream line (m)."""
+    out = np.full(len(areas), np.nan)
+    if rec is None or rec.empty:
+        return out
+    (src, _), dist = rec.sindex.nearest(areas.geometry.values, return_distance=True, return_all=False)
+    out[src] = dist
+    return out
+
+
+def dominant_land_cover(areas, lcdb):
+    """LCDB attributes of the land-cover class covering most of each polygon."""
+    out = pd.DataFrame(index=areas.index, columns=LCDB_COLUMNS, dtype=object)
+    if lcdb is None:
+        return out
+    lcdb = lcdb.iloc[lcdb.sindex.query(box(*areas.total_bounds), predicate="intersects")]
+    if lcdb.empty:
+        return out
+    pieces = gpd.overlay(
+        gpd.GeoDataFrame({"_pid": areas.index}, geometry=areas.geometry.values, crs=areas.crs),
+        lcdb[LCDB_COLUMNS + ["geometry"]], how="intersection", keep_geom_type=True,
     )
-    old_attributes = xdem.terrain.get_terrain_attribute(
-        masked_old,
-        resolution=old.res,
-        attribute=attribute_names
-    )
-    new_attributes = xdem.terrain.get_terrain_attribute(
-        masked_new,
-        resolution=old.res,
-        attribute=attribute_names
-    )
-
-    for i, name in enumerate(attribute_names):
-        row.update({
-            f"old_{name}_min": np.nanmin(old_attributes[i]),
-            f"old_{name}_max": np.nanmax(old_attributes[i]),
-            f"old_{name}_mean": np.nanmean(old_attributes[i]),
-            f"old_{name}_median": np.nanmedian(old_attributes[i]),
-            f"old_{name}_std": np.nanstd(old_attributes[i]),
-            f"new_{name}_min": np.nanmin(new_attributes[i]),
-            f"new_{name}_max": np.nanmax(new_attributes[i]),
-            f"new_{name}_mean": np.nanmean(new_attributes[i]),
-            f"new_{name}_median": np.nanmedian(new_attributes[i]),
-            f"new_{name}_std": np.nanstd(new_attributes[i]),
-            f"diff_{name}_min": np.nanmin(diff_attributes[i]),
-            f"diff_{name}_max": np.nanmax(diff_attributes[i]),
-            f"diff_{name}_mean": np.nanmean(diff_attributes[i]),
-            f"diff_{name}_median": np.nanmedian(diff_attributes[i]),
-            f"diff_{name}_std": np.nanstd(diff_attributes[i]),
-        })
-
-    return pd.Series(row)
+    if pieces.empty:
+        return out
+    pieces["_area"] = pieces.area
+    by_class = pieces.groupby(["_pid"] + LCDB_COLUMNS, dropna=False)["_area"].sum().reset_index()
+    best = by_class.loc[by_class.groupby("_pid")["_area"].idxmax()].set_index("_pid")
+    out.loc[best.index, LCDB_COLUMNS] = best[LCDB_COLUMNS].values
+    for col in ("Wetland_18", "Onshore_18"):
+        out[col] = out[col].map({"yes": True, "no": False, True: True, False: False})
+    return out
 
 
-def add_ndvi_features(areas):
-    """Add NDVI features to the areas dataframe."""
-    print("Adding NDVI features...")
+def process_tile(tile, refs, keep_intermediate=False):
+    """Detect change polygons in one DEM tile and compute their features."""
+    t = refs["tiles_new"].loc[tile]
+    res = float(t.res)
+    core = (t.left, t.bottom, t.right, t.top)
+    m = TERRAIN_MARGIN
+    hb = int(round(HYDRO_BUFFER / res))
+    other = "new" if HYDRO_EPOCH == "old" else "old"
 
-    if not os.path.exists(f"{DATA_DIR}/NDVI_2018.tif") or not os.path.exists(f"{DATA_DIR}/NDVI_2023.tif"):
-        print("NDVI rasters not found, skipping NDVI features")
+    # The hydrology DEM is read with a wide buffer; the terrain margin is a sub-window of it.
+    hydro_dem, hydro_transform = read_dem_window(refs[f"vrt_{HYDRO_EPOCH}"], expand(core, hb * res), res)
+    surfaces = {HYDRO_EPOCH: hydro_dem[hb - m: hydro_dem.shape[0] - hb + m, hb - m: hydro_dem.shape[1] - hb + m]}
+    surfaces[other], _ = read_dem_window(refs[f"vrt_{other}"], expand(core, m * res), res)
+    surfaces["diff"] = surfaces["new"] - surfaces["old"]
+    inner = (slice(m, -m), slice(m, -m))
+    core_transform = from_origin(t.left, t.top, res, res)
+
+    areas = detect_change_polygons(surfaces["diff"][inner], core_transform, res)
+    areas = split_by_river_polygons(areas, refs["river_polygons"])
+    if areas.empty:
         return areas
+    areas.insert(0, "tile", tile)
 
-    old_ndvi = rasterio.open(f"{DATA_DIR}/NDVI_2018.tif")
-    new_ndvi = rasterio.open(f"{DATA_DIR}/NDVI_2023.tif")
-    original_crs = areas.crs
+    labels = rasterize(((geom, i + 1) for i, geom in enumerate(areas.geometry)),
+                       out_shape=surfaces["diff"][inner].shape, transform=core_transform,
+                       fill=0, dtype="int32")
+    zones = Zones(labels, len(areas))
+    features = {}
 
-    def get_ndvi_features(row):
-        geom = row.geometry
-        masked_old, transform = mask(old_ndvi, [geom], nodata=np.nan, crop=True)
-        masked_new, transform = mask(new_ndvi, [geom], nodata=np.nan, crop=True)
-        masked_diff = masked_new - masked_old
-        row = row.to_dict()
-        row.update({
-            "NDVI_old_min": np.nanmin(masked_old),
-            "NDVI_old_max": np.nanmax(masked_old),
-            "NDVI_old_mean": np.nanmean(masked_old),
-            "NDVI_old_median": np.nanmedian(masked_old),
-            "NDVI_old_std": np.nanstd(masked_old),
-            "NDVI_new_min": np.nanmin(masked_new),
-            "NDVI_new_max": np.nanmax(masked_new),
-            "NDVI_new_mean": np.nanmean(masked_new),
-            "NDVI_new_median": np.nanmedian(masked_new),
-            "NDVI_new_std": np.nanstd(masked_new),
-            "NDVI_diff_min": np.nanmin(masked_diff),
-            "NDVI_diff_max": np.nanmax(masked_diff),
-            "NDVI_diff_mean": np.nanmean(masked_diff),
-            "NDVI_diff_median": np.nanmedian(masked_diff),
-            "NDVI_diff_std": np.nanstd(masked_diff)
-        })
-        return pd.Series(row)
+    # Elevation statistics
+    for name in ("old", "new", "diff"):
+        features.update(zones.stats(surfaces[name][inner], name))
+    features["distance_to_river"] = distance_to_river(areas, refs["rec2"])
 
-    areas = areas.progress_apply(get_ndvi_features, axis=1)
-    areas = gpd.GeoDataFrame(areas, geometry="geometry", crs=original_crs)
-    return areas
+    # Hydrological indices
+    workdir = os.path.abspath(os.path.join(WBT_DIR, tile))
+    try:
+        hydro = compute_hydrology(hydro_dem, hydro_transform, refs, workdir, (slice(hb, -hb), slice(hb, -hb)))
+    finally:
+        if not keep_intermediate:
+            shutil.rmtree(workdir, ignore_errors=True)
+    del hydro_dem
+    for name in HYDRO_FEATURES:
+        features.update(zones.stats(hydro[name], name))
+    del hydro
+
+    # Terrain attributes
+    for name in ("old", "new", "diff"):
+        for attribute in TERRAIN_ATTRIBUTES:
+            values = terrain_attribute(surfaces[name], attribute, res, labels > 0, m)
+            features.update(zones.stats(values, f"{name}_{attribute}"))
+
+    result = pd.concat([areas, pd.DataFrame(features, index=areas.index),
+                        dominant_land_cover(areas, refs["lcdb"])], axis=1)
+    return gpd.GeoDataFrame(result, geometry="geometry", crs=CRS)
 
 
+def process_tiles(refs, tiles=None, shard=0, num_shards=1, keep_intermediate=False, retries=2):
+    """Process DEM tiles, writing one parquet file per tile to ``TILE_RESULTS_DIR``."""
+    os.makedirs(TILE_RESULTS_DIR, exist_ok=True)
+    all_tiles = sorted(refs["tiles_new"].index)
+    if tiles:
+        unknown = set(tiles) - set(all_tiles)
+        if unknown:
+            raise SystemExit(f"Unknown tiles: {sorted(unknown)}")
+        all_tiles = [t for t in all_tiles if t in tiles]
+    my_tiles = all_tiles[shard::num_shards]
+    print(f"Processing {len(my_tiles)} of {len(all_tiles)} tiles (shard {shard + 1}/{num_shards})")
+
+    failed = []
+    for tile in tqdm(my_tiles, desc="Processing tiles"):
+        output_path = f"{TILE_RESULTS_DIR}/{tile}.parquet"
+        if os.path.exists(output_path):
+            continue
+        if tile not in refs["tiles_old"].index:
+            print(f"Skipping {tile}: not in the 2018-2020 collection")
+            continue
+        for attempt in range(1, retries + 2):
+            start = time.time()
+            try:
+                features = process_tile(tile, refs, keep_intermediate)
+                features.to_parquet(output_path)
+                tqdm.write(f"{tile}: {len(features)} polygons in {time.time() - start:.0f}s")
+                break
+            except Exception:
+                tqdm.write(f"Failed on {tile} (attempt {attempt}):\n{traceback.format_exc()}")
+        else:
+            failed.append(tile)
+    if failed:
+        print(f"{len(failed)} tiles failed: {failed}")
+    return failed
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: finalize
+# ---------------------------------------------------------------------------
 def join_parquet_files():
     """Join all individual tile parquet files into a single file."""
-    print("Joining parquet files from tile_results/...")
-
-    if not os.path.exists(TILE_RESULTS_DIR):
-        print(f"No {TILE_RESULTS_DIR} directory found, skipping join")
-        return None
-
-    files = glob(f"{TILE_RESULTS_DIR}/*.parquet")
+    print(f"Joining parquet files from {TILE_RESULTS_DIR}/...")
+    files = sorted(glob(f"{TILE_RESULTS_DIR}/*.parquet"))
     if not files:
         print(f"No parquet files found in {TILE_RESULTS_DIR}")
         return None
-
     print(f"Found {len(files)} parquet files to join")
-    areas = pd.concat(gpd.read_parquet(f) for f in tqdm(files))
+    areas = pd.concat((gpd.read_parquet(f) for f in tqdm(files)), ignore_index=True)
     print(f"Combined shape: {areas.shape}")
-
-    # Save the combined file
     areas.to_parquet(f"{OUTPUT_DIR}/areas.parquet")
     print(f"Saved combined areas to {OUTPUT_DIR}/areas.parquet")
-
     return areas
 
 
-def process_tiles(REC, all_streams, LCDB, river_polygons):
-    """Process DEM tiles to extract areas of change."""
-    from shapely.geometry import box as shapely_box
+def add_ndvi_features(areas):
+    """Add NDVI statistics (2018, 2023 and their difference) for each polygon."""
+    print("Adding NDVI features...")
+    paths = [f"{DATA_DIR}/NDVI_2018.tif", f"{DATA_DIR}/NDVI_2023.tif"]
+    if not all(os.path.exists(p) for p in paths):
+        print("NDVI rasters not found, skipping NDVI features")
+        return areas
 
-    manifest = pd.json_normalize(requests.get("https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2023/dem_1m/2193/collection.json").json()["links"])
-    manifest = manifest[manifest["rel"] == "item"]
-    manifest["tilename"] = manifest.href.str.replace(".json", "").str.strip("./")
+    with rasterio.open(paths[0]) as old_ndvi, rasterio.open(paths[1]) as new_ndvi:
+        def ndvi_stats(geom):
+            row = {}
+            try:
+                masked_old, _ = mask(old_ndvi, [geom], nodata=np.nan, crop=True)
+                masked_new, _ = mask(new_ndvi, [geom], nodata=np.nan, crop=True)
+            except ValueError:  # polygon outside the NDVI rasters
+                masked_old = masked_new = np.array([np.nan])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN slices
+                for name, values in (("old", masked_old), ("new", masked_new), ("diff", masked_new - masked_old)):
+                    for stat in STATS:
+                        row[f"NDVI_{name}_{stat}"] = getattr(np, f"nan{stat}")(values)
+            return row
 
-    # Create tile results directory
-    os.makedirs(TILE_RESULTS_DIR, exist_ok=True)
-    os.makedirs(WBT_DIR, exist_ok=True)
-
-    for tilename in tqdm(manifest.tilename, desc="Processing tiles"):
-        output_path = f"{TILE_RESULTS_DIR}/{tilename}.parquet"
-        if os.path.exists(output_path):
-            continue
-        try:
-            old = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2018-2020/dem_1m/2193/{tilename}.tiff")
-            new = rasterio.open(f"https://nz-elevation.s3.ap-southeast-2.amazonaws.com/gisborne/gisborne_2023/dem_1m/2193/{tilename}.tiff")
-            diff = new.read(1) - old.read(1)
-            result = diff.round().clip(min=-1, max=1).astype(np.int16)
-            result = sieve(result, 4000)
-            result = np.where(result != 0, result, np.nan)
-
-            # Create initial polygons
-            areas = gpd.GeoDataFrame(geometry=[shape(s) for s, v in shapes(result, transform=new.transform) if not np.isnan(v)])
-            areas["area"] = areas.area
-            areas = areas[areas.area > 4000]
-            areas.sort_values("area", ascending=False, inplace=True)
-            areas.crs = 2193
-
-            # SPLIT POLYGONS BEFORE COMPUTING FEATURES
-            if river_polygons is not None:
-                areas = split_by_river_polygons(areas, river_polygons)
-
-            # Compute hydrological indices using WhiteboxTools
-            # Save DEM to local file so WhiteboxTools can process it
-            tile_dem_path = f"{WBT_DIR}/{tilename}_dem.tif"
-            tile_streams_path = f"{WBT_DIR}/{tilename}_streams.gpkg"
-            hydro_rasters = None, None, None
-
-            if not os.path.exists(tile_dem_path):
-                with rasterio.open(tile_dem_path, 'w', **new.meta) as dst:
-                    dst.write(new.read())
-
-            # Clip REC streams to tile extent and save for rasterization
-            if not os.path.exists(tile_streams_path):
-                bounds = new.bounds
-                tile_bbox = gpd.GeoDataFrame(
-                    geometry=[shapely_box(bounds.left, bounds.bottom, bounds.right, bounds.top)],
-                    crs=new.crs
-                )
-                streams_clipped = gpd.clip(REC, tile_bbox)
-                if not streams_clipped.empty:
-                    streams_clipped.to_file(tile_streams_path, driver='GPKG')
-
-            if os.path.exists(tile_streams_path):
-                hydro_rasters = compute_hydrological_indices(tile_dem_path, tile_streams_path, tilename)
-
-            # Now compute features on split polygons
-            features = areas.progress_apply(
-                lambda row: get_features(row, old, new, diff, result, all_streams, LCDB, hydro_rasters),
-                axis=1
-            )
-            features = gpd.GeoDataFrame(features, geometry="geometry", crs=areas.crs)
-            features.to_parquet(output_path)
-        except Exception as e:
-            print(f"Failed on {tilename}: {e}")
-            continue
+        ndvi = pd.DataFrame([ndvi_stats(g) for g in tqdm(areas.geometry)], index=areas.index)
+    areas = areas.drop(columns=ndvi.columns, errors="ignore")
+    return gpd.GeoDataFrame(pd.concat([areas, ndvi], axis=1), geometry="geometry", crs=areas.crs)
 
 
-def main(force_rebuild=False):
-    """
-    Main processing pipeline.
-
-    Args:
-        force_rebuild: If True, rebuild areas.parquet from scratch even if it exists.
-                      If False, load existing areas.parquet if available.
-    """
-    print("Starting batch processing...")
-
-    # Load global datasets
-    REC, all_streams, LCDB, river_polygons = load_global_data()
-
-    # Process tiles if needed
+def finalize(force_rebuild=False):
     if force_rebuild or not os.path.exists(f"{OUTPUT_DIR}/areas.parquet"):
-        if force_rebuild and os.path.exists(f"{OUTPUT_DIR}/areas.parquet"):
-            print(f"\nForce rebuild requested - ignoring existing {OUTPUT_DIR}/areas.parquet")
-        print("\nProcessing DEM tiles...")
-        process_tiles(REC, all_streams, LCDB, river_polygons)
-
-        # Join results
         areas = join_parquet_files()
     else:
         print(f"Loading existing areas from {OUTPUT_DIR}/areas.parquet")
         areas = gpd.read_parquet(f"{OUTPUT_DIR}/areas.parquet")
+    if areas is None:
+        return
+    areas = add_ndvi_features(areas)
+    areas.to_parquet(f"{OUTPUT_DIR}/areas+NDVI.parquet")
+    print(f"Saved areas with NDVI to {OUTPUT_DIR}/areas+NDVI.parquet")
 
-    if areas is not None:
-        # Add NDVI features
-        areas_with_ndvi = add_ndvi_features(areas)
-        areas_with_ndvi.to_parquet(f"{OUTPUT_DIR}/areas+NDVI.parquet")
-        print(f"Saved areas with NDVI to {OUTPUT_DIR}/areas+NDVI.parquet")
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main(force_rebuild=False, stage="all", tiles=None, shard=0, num_shards=1, keep_intermediate=False):
+    """Run the pipeline.
+
+    Args:
+        force_rebuild: rebuild data/areas.parquet from tile results even if it
+            exists (tiles already in tile_results/ are reused; delete that
+            directory to recompute them).
+        stage: "all", "prepare", "tiles" or "finalize".
+        tiles: optional list of tile names to process.
+        shard, num_shards: process every ``num_shards``-th tile starting at ``shard``.
+        keep_intermediate: keep the WhiteboxTools rasters in wbt_outputs/.
+    """
+    print(f"Starting batch processing (stage: {stage})...")
+    failed = []
+    if stage in ("all", "prepare"):
+        prepare()
+    if stage == "tiles" or (stage == "all" and (force_rebuild or not os.path.exists(f"{OUTPUT_DIR}/areas.parquet"))):
+        refs = load_references()
+        failed = process_tiles(refs, tiles, shard, num_shards, keep_intermediate)
+    if stage in ("all", "finalize"):
+        finalize(force_rebuild=force_rebuild)
     print("\nBatch processing complete!")
+    return failed
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Process river data from DEM tiles.')
-    parser.add_argument('--force-rebuild', action='store_true',
-                       help='Force rebuild of areas.parquet from scratch (default: load existing if available)')
+    parser = argparse.ArgumentParser(description="Process river data from DEM tiles.")
+    parser.add_argument("--force-rebuild", action="store_true",
+                        help="Rebuild data/areas.parquet from tile results even if it exists")
+    parser.add_argument("--stage", choices=["all", "prepare", "tiles", "finalize"], default="all")
+    parser.add_argument("--tiles", nargs="+", help="Only process these tiles (e.g. BD44_10000_0503)")
+    parser.add_argument("--shard", type=int, default=0, help="Index of this shard (0-based)")
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards")
+    parser.add_argument("--keep-intermediate", action="store_true",
+                        help="Keep WhiteboxTools intermediate rasters in wbt_outputs/")
     args = parser.parse_args()
-    main(force_rebuild=args.force_rebuild)
+    failed_tiles = main(args.force_rebuild, args.stage, args.tiles, args.shard, args.num_shards,
+                        args.keep_intermediate)
+    sys.exit(1 if failed_tiles else 0)
