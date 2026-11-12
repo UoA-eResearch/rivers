@@ -52,9 +52,15 @@ FIELDS = [
     ("spi", "spi_median", "Stream power index", "", 1, "sequential", "Median stream power index"),
     ("ic", "connectivity_index_mean", "Connectivity index", "", 2, "sequential",
      "Mean Borselli index of sediment connectivity (higher = better connected to streams)"),
+    ("rock_age", "rock_age", "Rock age", "Ma", 1, "sequential",
+     "Age of the main geological unit (midpoint of its age range, millions of years; GNS Science)"),
+    ("landslide", "landslide_share", "In mapped landslide", "%", 0, "sequential",
+     "Share of the area inside landslides mapped by GNS Science at 1:250 000"),
     ("ndvi", "NDVI_old_mean", "NDVI 2018", "", 2, "sequential", "Mean NDVI (vegetation greenness) in 2018"),
     ("dndvi", "NDVI_diff_mean", "NDVI change", "", 2, "diverging", "Mean change in NDVI from 2018 to 2023"),
 ]
+
+SCALE = {"landslide": 100}  # stored as a fraction, shown as a percentage
 
 LCDB_CLASSES = {
     1: "Built-up Area (settlement)", 2: "Urban Parkland/Open Space", 5: "Transport Infrastructure",
@@ -80,7 +86,7 @@ MAX_ZOOM = 12
 
 def clean(value):
     """JSON-safe scalar (NaN -> None, numpy -> Python)."""
-    if value is None:
+    if value is None or value is pd.NA:
         return None
     if isinstance(value, (np.floating, float)):
         return None if not np.isfinite(value) else float(value)
@@ -94,11 +100,14 @@ def clean(value):
 def build_attributes(df, fields):
     attrs = pd.DataFrame({"id": np.arange(len(df)), "cluster": df["cluster"].astype(int).values})
     for key, column, _, _, decimals, _, _ in fields:
-        attrs[key] = df[column].astype(float).round(decimals).values
+        attrs[key] = (df[column].astype(float) * SCALE.get(key, 1)).round(decimals).values
     if "Class_2018" in df:
         attrs["lcdb"] = pd.to_numeric(df["Class_2018"], errors="coerce").values
     if "in_river" in df:
         attrs["in_river"] = df["in_river"].astype("boolean").fillna(False).astype(int).values
+    for key, column in (("rock", "rock_group"), ("unit", "rock_unit")):
+        if column in df:
+            attrs[key] = df[column].astype("string").replace("", pd.NA).values
     return attrs
 
 
@@ -147,6 +156,9 @@ def summarise(df, attrs, fields, wgs84):
             summary["land_cover"] = [[int(k), round(float(v), 3)] for k, v in shares.items()]
         if "in_river" in group:
             summary["in_river_share"] = clean(group["in_river"].mean())
+        if "rock" in group:
+            shares = group["rock"].value_counts(normalize=True).head(3)
+            summary["rock_types"] = [[str(k), round(float(v), 3)] for k, v in shares.items()]
         clusters.append(summary)
 
     return dict(
@@ -199,7 +211,8 @@ def main(source, out_dir):
         subprocess.run([
             "tile-join", "--force", "--quiet", "--no-tile-size-limit", "-o", out_path,
             "--name", "Gisborne erosion and deposition clusters",
-            "--attribution", "Elevation change: LINZ Gisborne LiDAR 2018-2020 and 2023",
+            "--attribution", "Elevation: LINZ (CC BY 4.0) · Land cover: LCDB v5.0, Manaaki Whenua (CC BY 4.0)"
+            " · Geology © GNS Science 2023 (CC BY 4.0)",
             os.path.join(tmp, "points.pmtiles"), os.path.join(tmp, "polygons.pmtiles"),
         ], check=True)
     print(f"Wrote {out_path} ({os.path.getsize(out_path) / 1e6:.1f} MB)")

@@ -1,3 +1,5 @@
 *.zip filter=lfs diff=lfs merge=lfs -text
 *.parquet filter=lfs diff=lfs merge=lfs -text
 *.tif filter=lfs diff=lfs merge=lfs -text
+# Study-area extracts are small and stored directly in git (not LFS) to save LFS bandwidth
+data/study_area/*.parquet !filter !diff !merge -text

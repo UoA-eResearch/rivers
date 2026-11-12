@@ -43,6 +43,10 @@ const SATELLITE_SOURCE = {
   attribution: "Imagery © Esri, Maxar, Earthstar Geographics and the GIS User Community",
 };
 
+const DATA_ATTRIBUTION =
+  'Elevation: <a href="https://www.linz.govt.nz/">LINZ</a> · Land cover: LCDB v5.0, Manaaki Whenua · ' +
+  'Geology © <a href="https://doi.org/10.21420/5XTJ-5718">GNS Science</a> 2023 (CC BY 4.0)';
+
 // Labels for the two ends of diverging scales
 const POLES = {
   dz: ["Erosion", "Deposition"],
@@ -127,7 +131,7 @@ function formatValue(field, value, { signed = false } = {}) {
   let text = number(value, field.decimals);
   if (signed && value > 0) text = `+${text}`;
   if (!field.unit) return text;
-  return field.unit === "°" ? `${text}°` : `${text} ${field.unit}`;
+  return field.unit === "°" || field.unit === "%" ? `${text}${field.unit}` : `${text} ${field.unit}`;
 }
 
 function ordinal(n) {
@@ -301,7 +305,7 @@ function buildStyle(base) {
   const style = structuredClone(base);
   basemapLayers = Object.fromEntries(style.layers.map((l) => [l.id, l.layout?.visibility || "visible"]));
   style.sources.satellite = SATELLITE_SOURCE;
-  style.sources.clusters = { type: "vector", url: `pmtiles://${tilesUrl}` };
+  style.sources.clusters = { type: "vector", url: `pmtiles://${tilesUrl}`, attribution: DATA_ATTRIBUTION };
   const satellite = state.basemap === "satellite";
   if (satellite) {
     for (const layer of style.layers) layer.layout = { ...layer.layout, visibility: "none" };
@@ -439,6 +443,8 @@ function popupContent(props) {
       el("strong", {}, formatValue(f, props[f.key], { signed: f.key.startsWith("dz") }))));
   const landCover = landCoverName(props.lcdb);
   if (landCover) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Land cover 2018"), el("strong", {}, landCover)));
+  if (props.rock) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Rock type"), el("strong", {}, props.rock)));
+  if (props.unit) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Geological unit"), el("strong", {}, props.unit)));
   if (props.in_river === 1) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Location"), el("strong", {}, "In a river channel")));
 
   return el("div", {},
@@ -680,6 +686,12 @@ function renderProfile() {
         el("tr", {}, el("td", {}, "Total area"), series.map((s) => el("td", {}, `${number(s.cluster.area_ha, 0)} ha`))),
         el("tr", {}, el("td", {}, "Erosion share"), series.map((s) => el("td", {}, `${number(s.cluster.erosion_share * 100, 0)}%`))),
         profileFields().map((field) => el("tr", {}, el("td", {}, field.label), series.map((s) => cell(s, field)))),
+        summary.clusters.some((c) => c.rock_types)
+          ? el("tr", {}, el("td", {}, "Main rock types"),
+            series.map((s) => el("td", { class: "land-cover" },
+              (s.cluster.rock_types || []).slice(0, 2).map(([name, share]) =>
+                el("div", {}, `${name} (${number(share * 100, 0)}%)`)))))
+          : null,
         el("tr", {}, el("td", {}, "Main land cover"),
           series.map((s) => el("td", { class: "land-cover" },
             (s.cluster.land_cover || []).length

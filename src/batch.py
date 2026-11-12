@@ -5,9 +5,11 @@ The pipeline has three stages, which can be run together (the default) or
 separately so that the tile stage can be spread over several machines:
 
 ``prepare``
-    Index the DEM tiles of both epochs (2018-2020 and 2023), write a GDAL VRT
-    for each epoch, and clip REC2 streams, LCDB land cover and LINZ river
-    polygons to the study region (written to ``prepared/``).
+    Index the DEM tiles of both epochs (2018-2020 and 2023) and write a GDAL VRT
+    for each epoch (``prepared/``). The reference layers (REC2 streams, LCDB land
+    cover, LINZ river polygons, GNS geology) are read from study-area extracts
+    committed in ``data/study_area/``; ``--rebuild-extracts`` rebuilds them from
+    the national datasets.
 ``tiles``
     For each DEM tile: detect polygons of elevation change, split them at river
     polygon boundaries, then compute per-polygon features (elevation, terrain,
@@ -33,7 +35,6 @@ import sys
 import time
 import traceback
 import warnings
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 
@@ -72,6 +73,7 @@ DATA_DIR = "data"
 OUTPUT_DIR = "data"
 TILE_RESULTS_DIR = "tile_results"
 PREPARED_DIR = "prepared"
+STUDY_AREA_DIR = f"{DATA_DIR}/study_area"  # committed study-area extracts of the reference layers
 WBT_DIR = "wbt_outputs"
 
 DEM_COLLECTIONS = {
@@ -87,6 +89,25 @@ LCDB_GPKG = "lcdb-v50-land-cover-database-version-50-mainland-new-zealand.gpkg"
 RIVERS_ZIP = f"{DATA_DIR}/lds-nz-river-polygons-topo-150k-GPKG.zip"
 RIVERS_GPKG = "nz-river-polygons-topo-150k.gpkg"
 LCDB_COLUMNS = ["Class_2018", "Wetland_18", "Onshore_18"]
+# GNS Science Geological Map of New Zealand 1:250 000, 4th edition (CC BY 4.0).
+# Not stored in the repository; downloaded when the extracts are rebuilt.
+GEOLOGY_ZIP = f"{DATA_DIR}/NZL_GNS_250K_Geology_2023_Data_Package.zip"
+GEOLOGY_URL = ("https://data.gns.cri.nz/rgmad/downloads/Geology/NZL_GNS_250K_Geology_2023/"
+               "NZL_GNS_250K_Geology_2023_Data_Package.zip")
+GEOLOGY_GDB = "NZL_GNS_250K_Geology.gdb"
+GEOLOGY_COLUMNS = ["ROCKGROUP", "KEYGRPNAME", "SIMPLENAME", "ABSMIN_MA", "ABSMAX_MA"]
+DOWNLOADS = {GEOLOGY_ZIP: GEOLOGY_URL}
+
+# Reference layers, clipped to the study area and committed to data/study_area/ so
+# runs don't need the national archives (~1.2 GB from Git LFS). Rebuild them with
+# --rebuild-extracts: name -> (archive, file in the archive, pyogrio read options)
+REFERENCE_LAYERS = {
+    "rec2": (REC_ZIP, REC_GDB, dict(layer="riverlines", columns=["nzsegment", "StreamOrde", "CUM_AREA"])),
+    "lcdb": (LCDB_ZIP, LCDB_GPKG, dict(columns=LCDB_COLUMNS)),
+    "river_polygons": (RIVERS_ZIP, RIVERS_GPKG, dict(columns=[])),
+    "geology": (GEOLOGY_ZIP, GEOLOGY_GDB, dict(layer="NZL_GNS_250K_geological_units", columns=GEOLOGY_COLUMNS)),
+    "landslides": (GEOLOGY_ZIP, GEOLOGY_GDB, dict(layer="NZL_GNS_250K_landslide_units", columns=[])),
+}
 
 # Change detection
 MIN_AREA = 4000  # m^2; minimum polygon area, also the sieve size (in 1 m pixels)
@@ -167,15 +188,6 @@ D8_OFFSETS = {
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-def extract(zip_path, member):
-    """Extract ``zip_path`` into the working directory unless ``member`` exists."""
-    if not os.path.exists(member):
-        print(f"Extracting {zip_path}...")
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(".")
-    return member
-
-
 def grid_bounds(array_shape, transform):
     """(left, bottom, right, top) of a north-up raster grid."""
     left, top = transform.c, transform.f
@@ -316,8 +328,43 @@ def write_vrt(index, path):
         f.write(xml)
 
 
-def prepare(force=False):
-    """Build the tile indexes/VRTs and region-clipped reference layers."""
+def study_region(indexes):
+    """Bounds of all DEM tiles plus the margin needed for buffered processing."""
+    tiles = pd.concat(indexes.values())
+    return expand((tiles.left.min(), tiles.bottom.min(), tiles.right.max(), tiles.top.max()),
+                  HYDRO_BUFFER + STREAM_SNAP_DISTANCE + 1000)
+
+
+def build_extracts(region, force=False):
+    """Clip the national reference layers to the study region, into data/study_area/."""
+    os.makedirs(STUDY_AREA_DIR, exist_ok=True)
+    for name, (zip_path, member, kwargs) in REFERENCE_LAYERS.items():
+        out_path = f"{STUDY_AREA_DIR}/{name}.parquet"
+        if os.path.exists(out_path) and not force:
+            continue
+        if not os.path.exists(zip_path) and zip_path in DOWNLOADS:
+            print(f"Downloading {DOWNLOADS[zip_path]}...")
+            with requests.get(DOWNLOADS[zip_path], stream=True, timeout=600) as r:
+                r.raise_for_status()
+                with open(zip_path, "wb") as f:
+                    shutil.copyfileobj(r.raw, f)
+        if not os.path.exists(zip_path):
+            print(f"{zip_path} not found, can't build {out_path}")
+            continue
+        start = time.time()
+        source = f"/vsizip/{os.path.abspath(zip_path)}/{member}"  # read in place, without unzipping
+        gdf = gpd.read_file(source, bbox=region, engine="pyogrio", **kwargs)
+        gdf = gdf.to_crs(CRS)
+        gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()]
+        gdf["geometry"] = gdf.geometry.make_valid()
+        gdf = gpd.clip(gdf, region, keep_geom_type=True)
+        gdf = gdf[~gdf.geometry.is_empty].reset_index(drop=True)
+        gdf.to_parquet(out_path, compression="zstd", compression_level=19)
+        print(f"Extracted {name}: {len(gdf)} features in {time.time() - start:.1f}s")
+
+
+def prepare(force=False, rebuild_extracts=False):
+    """Build the DEM tile indexes and VRTs, and any missing study-area extracts."""
     os.makedirs(PREPARED_DIR, exist_ok=True)
     indexes = {}
     for epoch in DEM_COLLECTIONS:
@@ -326,36 +373,13 @@ def prepare(force=False):
             build_tile_index(epoch).to_csv(index_path, index=False)
         indexes[epoch] = pd.read_csv(index_path)
         write_vrt(indexes[epoch], f"{PREPARED_DIR}/dem_{epoch}.vrt")
-
-    tiles = pd.concat(indexes.values())
-    region = expand((tiles.left.min(), tiles.bottom.min(), tiles.right.max(), tiles.top.max()),
-                    HYDRO_BUFFER + STREAM_SNAP_DISTANCE + 1000)
-
-    layers = {
-        "rec2": (REC_ZIP, REC_GDB, dict(layer="riverlines", columns=["nzsegment", "StreamOrde", "CUM_AREA"])),
-        "lcdb": (LCDB_ZIP, LCDB_GPKG, dict(columns=LCDB_COLUMNS)),
-        "river_polygons": (RIVERS_ZIP, RIVERS_GPKG, dict(columns=[])),
-    }
-    for name, (zip_path, member, kwargs) in layers.items():
-        out_path = f"{PREPARED_DIR}/{name}.parquet"
-        if os.path.exists(out_path) and not force:
-            continue
-        if not os.path.exists(zip_path):
-            print(f"{zip_path} not found, skipping {name}")
-            continue
-        start = time.time()
-        gdf = gpd.read_file(extract(zip_path, member), bbox=region, engine="pyogrio", **kwargs)
-        gdf = gdf.to_crs(CRS)
-        gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()]
-        gdf["geometry"] = gdf.geometry.make_valid()
-        gdf.to_parquet(out_path)
-        print(f"Prepared {name}: {len(gdf)} features in {time.time() - start:.1f}s")
+    build_extracts(study_region(indexes), force=rebuild_extracts)
 
 
 def load_references():
     refs = {}
-    for name in ("rec2", "lcdb", "river_polygons"):
-        path = f"{PREPARED_DIR}/{name}.parquet"
+    for name in REFERENCE_LAYERS:
+        path = f"{STUDY_AREA_DIR}/{name}.parquet"
         refs[name] = gpd.read_parquet(path) if os.path.exists(path) else None
         if refs[name] is None:
             print(f"Warning: {path} not found; features depending on it will be missing")
@@ -659,26 +683,50 @@ def distance_to_river(areas, rec):
     return out
 
 
-def dominant_land_cover(areas, lcdb):
-    """LCDB attributes of the land-cover class covering most of each polygon."""
-    out = pd.DataFrame(index=areas.index, columns=LCDB_COLUMNS, dtype=object)
-    if lcdb is None:
+def dominant_attributes(areas, layer, columns):
+    """Attributes of the ``layer`` class (unique combination of ``columns``) covering most of each polygon."""
+    out = pd.DataFrame(index=areas.index, columns=columns, dtype=object)
+    if layer is None:
         return out
-    lcdb = lcdb.iloc[lcdb.sindex.query(box(*areas.total_bounds), predicate="intersects")]
-    if lcdb.empty:
+    layer = layer.iloc[layer.sindex.query(box(*areas.total_bounds), predicate="intersects")]
+    if layer.empty:
         return out
     pieces = gpd.overlay(
         gpd.GeoDataFrame({"_pid": areas.index}, geometry=areas.geometry.values, crs=areas.crs),
-        lcdb[LCDB_COLUMNS + ["geometry"]], how="intersection", keep_geom_type=True,
+        layer[columns + ["geometry"]], how="intersection", keep_geom_type=True,
     )
     if pieces.empty:
         return out
     pieces["_area"] = pieces.area
-    by_class = pieces.groupby(["_pid"] + LCDB_COLUMNS, dropna=False)["_area"].sum().reset_index()
+    by_class = pieces.groupby(["_pid"] + columns, dropna=False)["_area"].sum().reset_index()
     best = by_class.loc[by_class.groupby("_pid")["_area"].idxmax()].set_index("_pid")
-    out.loc[best.index, LCDB_COLUMNS] = best[LCDB_COLUMNS].values
+    out.loc[best.index, columns] = best[columns].values
+    return out
+
+
+def dominant_land_cover(areas, lcdb):
+    """LCDB attributes of the land-cover class covering most of each polygon."""
+    out = dominant_attributes(areas, lcdb, LCDB_COLUMNS)
     for col in ("Wetland_18", "Onshore_18"):
         out[col] = out[col].map({"yes": True, "no": False, True: True, False: False})
+    return out
+
+
+def geology(areas, units, landslides):
+    """Geological unit covering most of each polygon, and the share inside mapped landslides."""
+    g = dominant_attributes(areas, units, GEOLOGY_COLUMNS)
+    out = pd.DataFrame({
+        "rock_group": g["ROCKGROUP"],
+        "rock_unit": g["KEYGRPNAME"],
+        "rock_name": g["SIMPLENAME"],
+        # midpoint of the unit's age range, in millions of years
+        "rock_age": (pd.to_numeric(g["ABSMIN_MA"]) + pd.to_numeric(g["ABSMAX_MA"])) / 2,
+    }, index=areas.index)
+    out["landslide_share"] = 0.0
+    if landslides is not None:
+        nearby = landslides.iloc[landslides.sindex.query(box(*areas.total_bounds), predicate="intersects")]
+        if not nearby.empty:
+            out["landslide_share"] = (areas.geometry.intersection(nearby.union_all()).area / areas.area).values
     return out
 
 
@@ -735,7 +783,8 @@ def process_tile(tile, refs, keep_intermediate=False):
             features.update(zones.stats(values, f"{name}_{attribute}"))
 
     result = pd.concat([areas, pd.DataFrame(features, index=areas.index),
-                        dominant_land_cover(areas, refs["lcdb"])], axis=1)
+                        dominant_land_cover(areas, refs["lcdb"]),
+                        geology(areas, refs["geology"], refs["landslides"])], axis=1)
     return gpd.GeoDataFrame(result, geometry="geometry", crs=CRS)
 
 
@@ -837,7 +886,8 @@ def finalize(force_rebuild=False):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main(force_rebuild=False, stage="all", tiles=None, shard=0, num_shards=1, keep_intermediate=False):
+def main(force_rebuild=False, stage="all", tiles=None, shard=0, num_shards=1, keep_intermediate=False,
+         rebuild_extracts=False):
     """Run the pipeline.
 
     Args:
@@ -848,11 +898,12 @@ def main(force_rebuild=False, stage="all", tiles=None, shard=0, num_shards=1, ke
         tiles: optional list of tile names to process.
         shard, num_shards: process every ``num_shards``-th tile starting at ``shard``.
         keep_intermediate: keep the WhiteboxTools rasters in wbt_outputs/.
+        rebuild_extracts: rebuild data/study_area/ from the national archives.
     """
     print(f"Starting batch processing (stage: {stage})...")
     failed = []
     if stage in ("all", "prepare"):
-        prepare()
+        prepare(rebuild_extracts=rebuild_extracts)
     if stage == "tiles" or (stage == "all" and (force_rebuild or not os.path.exists(f"{OUTPUT_DIR}/areas.parquet"))):
         refs = load_references()
         failed = process_tiles(refs, tiles, shard, num_shards, keep_intermediate)
@@ -872,7 +923,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards")
     parser.add_argument("--keep-intermediate", action="store_true",
                         help="Keep WhiteboxTools intermediate rasters in wbt_outputs/")
+    parser.add_argument("--rebuild-extracts", action="store_true",
+                        help=f"Rebuild {STUDY_AREA_DIR}/ from the national archives in {DATA_DIR}/")
     args = parser.parse_args()
     failed_tiles = main(args.force_rebuild, args.stage, args.tiles, args.shard, args.num_shards,
-                        args.keep_intermediate)
+                        args.keep_intermediate, args.rebuild_extracts)
     sys.exit(1 if failed_tiles else 0)

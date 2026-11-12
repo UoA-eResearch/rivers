@@ -20,17 +20,15 @@ env:
   PYTHON_VERSION: '3.11'
 
 jobs:
-  # Index the DEM tiles and clip REC2 / LCDB / river polygons to the study area,
-  # so the tile jobs below don't each need the large LFS archives.
+  # Index the DEM tiles. The reference layers come from the study-area extracts
+  # committed in data/study_area/, so no LFS downloads are needed.
   prepare:
     if: ${{ inputs.load_areas_from_file != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-    - name: Checkout code with reference data
-      uses: nschloe/action-cached-lfs-checkout@v1
-      with:
-        include: 'data/REC2_geodata_version_5.zip,data/lris-lcdb-*.zip,data/lds-nz-river-polygons-*.zip'
+    - name: Checkout code
+      uses: actions/checkout@v4
 
     - name: Set up Python
       uses: actions/setup-python@v5
