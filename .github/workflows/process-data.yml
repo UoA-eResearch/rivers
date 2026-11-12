@@ -12,37 +12,149 @@ on:
     # Run monthly on the 1st at 00:00 UTC
     - cron: '0 0 1 * *'
 
-jobs:
-  process:
-    runs-on: ubuntu-latest
-    timeout-minutes: 480  # 8 hours timeout
+permissions:
+  contents: write
 
+concurrency:
+  group: process-rivers-data
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # Index the DEM tiles and clip REC2 / LCDB / river polygons to the study area,
+  # so the tile jobs below don't each need the large LFS archives.
+  prepare:
+    if: ${{ inputs.load_areas_from_file != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-    - name: Checkout code
+    - name: Checkout code with reference data
       uses: nschloe/action-cached-lfs-checkout@v1
+      with:
+        include: 'data/REC2_geodata_version_5.zip,data/lris-lcdb-*.zip,data/lds-nz-river-polygons-*.zip'
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: pip
 
     - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
+      run: pip install -r requirements.txt
 
-    - name: Run batch processing
+    - name: Prepare reference data
+      run: python src/batch.py --stage prepare
+
+    - name: Upload prepared data
+      uses: actions/upload-artifact@v4
+      with:
+        name: prepared
+        path: prepared/
+        retention-days: 7
+
+  # The 305 DEM tiles take ~5 minutes each, far more than one job's 6 hour
+  # limit, so they are split across parallel jobs.
+  tiles:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: pip
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Download prepared data
+      uses: actions/download-artifact@v4
+      with:
+        name: prepared
+        path: prepared/
+
+    # Exits non-zero if any tile failed (after retries); use "Re-run failed jobs"
+    # and the finalize job will run once every shard has succeeded.
+    - name: Process tiles
+      run: python src/batch.py --stage tiles --shard ${{ strategy.job-index }} --num-shards ${{ strategy.job-total }}
+
+    - name: Upload tile results
+      uses: actions/upload-artifact@v4
+      with:
+        name: tile-results-${{ matrix.shard }}
+        path: tile_results/
+        retention-days: 7
+
+  finalize:
+    needs: tiles
+    # Run after all tile jobs succeed, or on its own when loading data/areas.parquet
+    if: ${{ !cancelled() && (needs.tiles.result == 'success' || inputs.load_areas_from_file == true) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+    - name: Checkout code with NDVI rasters
+      uses: nschloe/action-cached-lfs-checkout@v1
+      with:
+        include: ${{ inputs.load_areas_from_file == true && 'data/NDVI_*.tif,data/areas.parquet' || 'data/NDVI_*.tif' }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: pip
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Download tile results
+      if: ${{ needs.tiles.result == 'success' }}
+      uses: actions/download-artifact@v4
+      with:
+        pattern: tile-results-*
+        path: tile_results/
+        merge-multiple: true
+
+    - name: Join tile results and add NDVI features
       run: |
-        if [ "${{ github.event.inputs.load_areas_from_file }}" = "false" ] || [ -z "${{ github.event.inputs.load_areas_from_file }}" ]; then
-          python src/batch.py --force-rebuild
+        if [ "${{ needs.tiles.result }}" = "success" ]; then
+          python src/batch.py --stage finalize --force-rebuild
         else
-          python src/batch.py
+          python src/batch.py --stage finalize
         fi
 
     - name: Run clustering notebook
       run: |
-        jupyter nbconvert --to notebook --execute notebooks/clustering.ipynb --output notebooks/clustering.ipynb
-        jupyter nbconvert --to html notebooks/clustering.ipynb --output clustering.html
+        jupyter nbconvert --to notebook --execute --inplace notebooks/clustering.ipynb
+        jupyter nbconvert --to html notebooks/clustering.ipynb --output-dir . --output clustering
+
+    - name: Build interactive map data
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq tippecanoe
+        python src/make_web_map.py
+
+    - name: Commit and push results
+      run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git pull
-        git commit -am "Update data"
+        git lfs install --local  # make sure the parquet files are stored with LFS
+        git add data/areas.parquet data/clusters.parquet notebooks/clustering.ipynb clustering.html \
+          map/clusters.pmtiles map/clusters.json
+        if git diff --cached --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        git commit -m "Update data"
+        git pull --rebase
+        git push
