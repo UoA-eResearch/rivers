@@ -32,7 +32,8 @@ The analysis identifies areas where the elevation changed by more than about hal
 - **Hydrological indices** (WhiteboxTools): downslope distance to stream, elevation above stream, depth to water, topographic wetness index (TWI), stream power index (SPI)
 - **Sediment connectivity**: Borselli et al. (2008) index of connectivity, weighted by slope and land cover
 - **Vegetation indices**: NDVI in 2018 and 2023, and the change between them
-- **Land cover data**: LCDB (Land Cover Database) 2018 class of each polygon
+- **Land cover data**: LCDB v6.0 (Land Cover Database) 2018 class of each polygon, plus its 2023 class
+- **Geology**: rock type, geological unit and age from the GNS Science 1:250 000 geological map, and the share of each polygon inside mapped landslides
 - **River polygons**: change polygons are split at river polygon boundaries BEFORE feature extraction
 - **Clustering**: weighted k-means clustering to identify similar erosion/deposition patterns
 
@@ -44,8 +45,9 @@ The analysis identifies areas where the elevation changed by more than about hal
 │   ├── NDVI_2018.tif              # NDVI raster for 2018
 │   ├── NDVI_2023.tif              # NDVI raster for 2023
 │   ├── REC2_geodata_version_5.zip # River Environment Classification data
-│   ├── lris-lcdb-v50-*.zip        # Land Cover Database
+│   ├── lris-lcdb-v50-*.zip        # Land Cover Database v5.0 (no longer used; v6.0 is fetched from LRIS)
 │   ├── lds-nz-river-polygons-*.zip # NZ river polygons
+│   ├── study_area/                # Study-area extracts of REC2, LCDB, river polygons and GNS geology (plain git)
 │   ├── areas.parquet              # Elevation change polygons with features
 │   └── clusters.parquet           # Clustered results
 ├── src/                            # Python source code
@@ -67,7 +69,7 @@ The analysis identifies areas where the elevation changed by more than about hal
 └── README.md                      # This file
 ```
 
-Running the pipeline also creates `prepared/` (tile index and study-area extracts of the reference data), `tile_results/` (one parquet file per DEM tile) and `data/areas+NDVI.parquet`; these are not committed.
+Running the pipeline also creates `prepared/` (DEM tile index and VRTs), `tile_results/` (one parquet file per DEM tile) and `data/areas+NDVI.parquet`; these are not committed.
 
 ## How It Works
 
@@ -77,7 +79,7 @@ The pipeline has three stages, which run in sequence by default:
 
 1. **Prepare** (`--stage prepare`)
    - Reads the header of every DEM tile of both epochs from the LINZ AWS S3 bucket, and writes a tile index and a GDAL VRT mosaic per epoch
-   - Extracts REC2 river lines, LCDB land cover and LINZ river polygons for the study area into `prepared/`
+   - The reference layers (REC2 river lines, LCDB land cover, LINZ river polygons and GNS geology) are read from the study-area extracts committed in `data/study_area/`, so no large downloads are needed; `--rebuild-extracts` rebuilds them from the national datasets (see `data/study_area/README.md`)
 
 2. **Tiles** (`--stage tiles`): for each of the 305 DEM tiles
    - Reads the 2018-2020 and 2023 DEMs (NoData handled as missing, so gaps in one epoch are not mistaken for change) and computes the elevation difference
@@ -101,7 +103,7 @@ The pipeline has three stages, which run in sequence by default:
 The clustering notebook:
 - Loads the processed data with NDVI features
 - Groups the features by the variable they describe (e.g. the 15 slope statistics, the 5 TWI statistics, distance to river) and weights them so every variable contributes equally to the k-means distance, regardless of how many columns describe it (weights can be changed with `GROUP_WEIGHTS`)
-- One-hot encodes the LCDB land-cover class, and log-transforms the heavily skewed polygon area and SPI
+- One-hot encodes the LCDB land-cover class and the GNS rock group, and log-transforms the heavily skewed polygon area, rock age and SPI
 - Performs K-means clustering (k=25)
 - Visualizes results on interactive maps
 - Exports clustered data to GeoPackage for GIS software
@@ -127,9 +129,9 @@ cd rivers
 pip install -r requirements.txt
 ```
 
-3. Fetch the data files tracked with Git LFS (or download them from the sources below into `data/`):
+3. The reference layers are in `data/study_area/`. The NDVI rasters, which the finalize stage needs, are tracked with Git LFS:
 ```bash
-git lfs pull
+git lfs pull --include="data/NDVI_*.tif"
 ```
 
 WhiteboxTools downloads its binary automatically the first time it is used.
@@ -191,7 +193,7 @@ This will:
 ### Automated Processing with GitHub Actions
 
 The repository includes a GitHub Actions workflow that runs the whole pipeline monthly (or when triggered manually):
-- **prepare**: checks out the REC2, LCDB and river polygon archives from LFS and extracts the study area
+- **prepare**: indexes the DEM tiles (the reference layers come from `data/study_area/`, so this needs no LFS downloads)
 - **tiles**: 30 parallel jobs each process a share of the DEM tiles (a single job would exceed GitHub's 6 hour limit)
 - **finalize**: joins the tiles, adds NDVI, runs the clustering notebook, rebuilds the interactive map's data, and commits `data/areas.parquet`, `data/clusters.parquet`, `notebooks/clustering.ipynb`, `clustering.html` and `map/clusters.*` back to the repository
 
@@ -235,10 +237,17 @@ For each erosion/deposition polygon, the following features are extracted. Unles
 - `tile`: DEM tile the polygon came from
 - `area`: Polygon area in m²
 - `distance_to_river`: Distance to nearest REC2 stream (m)
-- `Class_2018`: LCDB 2018 land cover class covering most of the polygon
+- `Class_2018`: LCDB v6.0 2018 land cover class covering most of the polygon
 - `Wetland_18`, `Onshore_18`: LCDB wetland and onshore flags of that class
+- `Class_2023`: LCDB v6.0 2023 land cover class covering most of the polygon
 - `in_river`: True for (parts of) polygons inside a river polygon
 - `split_by_river`: True for parts of polygons that straddled a river polygon boundary
+
+**Geology** (GNS Science 1:250 000 geological map, 4th edition):
+- `rock_group`: rock type of the geological unit covering most of the polygon (e.g. mudstone, alternating sandstone/mudstone)
+- `rock_unit`, `rock_name`: its stratigraphic group (e.g. East Coast Allochthon, Tolaga Group) and description
+- `rock_age`: midpoint of the unit's age range (millions of years)
+- `landslide_share`: share of the polygon inside landslides mapped by GNS (0-1)
 
 ## Methods and Limitations
 
@@ -252,7 +261,9 @@ For each erosion/deposition polygon, the following features are extracted. Unles
 
 **Connectivity index.** IC = log10(D_up / D_dn) (Borselli et al. 2008), where D_up = W̄ · S̄ · √A uses the mean weighting factor W̄ and slope S̄ of the upslope contributing area A, and D_dn = Σ dᵢ / (Wᵢ · Sᵢ) sums along the D8 flow path to the nearest stream cell. S is the slope gradient bounded to 0.005-1 m/m (Cavalli et al. 2013), and W is a RUSLE cover-management (C) factor assigned to each LCDB class (`LCDB_C_FACTOR` in `src/batch.py`). The C-factor values are indicative and should be reviewed for the study area. Cells whose flow path leaves the buffered tile before reaching a stream have no value.
 
-**Land cover.** Each polygon gets the LCDB class covering the largest part of its area.
+**Land cover and geology.** Each polygon gets the LCDB class and the GNS geological unit covering the largest part of its area. The 2018 land cover (before the change) is used for the clustering and the connectivity weights. The 2023 land cover was mapped after much of the change, so it describes the outcome (e.g. new landslide or harvested-forest areas); it is kept as a column and shown on the map, and can be added to the clustering through `GROUP_WEIGHTS` in the notebook. The geological map is at 1:250 000 (positional accuracy of hundreds of metres), so it describes the setting of an area rather than the rock exactly beneath it.
+
+**Soil and land use.** Soil (S-map, the Fundamental Soil Layers) and NZLRI land use capability, rock and erosion data aren't used. The NZLRI and FSL layers on the Manaaki Whenua LRIS portal are under the Landcare Data Use Licence, which doesn't allow the data or derivatives to be passed to third parties, and S-map is CC BY-NC-ND, so results derived from them couldn't be published here. The GNS geological map (CC BY 4.0) is used for rock type instead.
 
 **Aspect** is a circular quantity (0° and 360° are the same direction), so its mean, median and std are only approximate summaries.
 
@@ -275,7 +286,7 @@ K-means clustering groups similar erosion/deposition patterns:
 The [interactive map](https://uoa-eresearch.github.io/rivers/) (`index.html`, hosted with GitHub Pages; its script, styles and data are in `map/`) shows every polygon, as dots when zoomed out and as shapes when zoomed in. You can:
 - Highlight up to three clusters to compare (the rest stay grey), from the cluster table or a polygon's popup
 - Compare the highlighted clusters' profiles: where each cluster's median slope, elevation change, NDVI, etc. sits among all areas, as a chart or table
-- Colour the polygons by a variable instead (elevation change, slope, curvature, distance to river, NDVI and, once the pipeline has been rerun, the hydrological and connectivity indices)
+- Colour the polygons by a variable instead (elevation change, slope, curvature, distance to river, NDVI, the hydrological and connectivity indices, rock age and share in mapped landslides); popups also show the land cover, rock type and geological unit
 - Show only erosion or only deposition, switch between a map and satellite basemap, and click a polygon for its values
 - Share a view: the selection, colouring and position are kept in the URL
 
@@ -296,19 +307,22 @@ Implemented:
 - [x] **Borselli's connectivity index**: sediment connectivity using slope and land cover
 - [x] **K-means weighting**: weighted clustering for imbalanced features
 - [x] **Additional terrain indices**: TWI (Topographic Wetness Index), SPI (Stream Power Index)
+- [x] **Geology**: rock type, unit, age and mapped landslides from the GNS 1:250 000 geological map
+- [x] **Study-area extracts** of the reference layers committed in `data/study_area/`, so runs don't download the national archives (~1.2 GB of LFS bandwidth)
+- [x] **LCDB v6.0**, which adds 2023 land cover, in place of v5.0
 
 Possible next steps:
 
-- [ ] **Soil and land use**: add soil type (e.g. S-map or the Fundamental Soil Layer) or NZLRI erosion and rock type data from the Manaaki Whenua LRIS portal
-- [ ] **Commit the study-area extracts** of REC2 and LCDB (a few tens of MB) so the workflow doesn't need to download the full national archives (~1.2 GB of LFS bandwidth) each run
+- [ ] **Soil and land use**: S-map, the Fundamental Soil Layers and NZLRI aren't openly licensed (see [Methods and Limitations](#methods-and-limitations)); using them would need permission from Manaaki Whenua – Landcare Research
 
 ## Data Sources
 
 - **DEM Data**: LINZ Gisborne 1m DEM (2018-2020, 2023) via AWS S3
 - **NDVI Data**: Copernicus Sentinel-2 via Google Earth Engine
 - **River Network**: NIWA River Environment Classification (REC2) v5
-- **Land Cover**: Manaaki Whenua LCDB v5.0
-- **River Polygons**: LINZ NZ River Polygons (Topo, 1:50k)
+- **Land Cover**: Manaaki Whenua – Landcare Research LCDB v6.0 (CC BY 4.0)
+- **River Polygons**: LINZ NZ River Polygons (Topo, 1:50k) (CC BY 4.0)
+- **Geology**: © GNS Science 2023. Heron, D.W. (custodian) 2023: Geological Map of New Zealand 1:250 000 (4th ed.) [digital data]. Lower Hutt (NZ): GNS Science. https://doi.org/10.21420/5XTJ-5718 (CC BY 4.0)
 
 ## References
 
