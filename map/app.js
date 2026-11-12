@@ -1,8 +1,8 @@
 "use strict";
 
-// Data written by src/make_web_map.py
-const SUMMARY_URL = "clusters.json";
-const TILES_URL = "clusters.pmtiles";
+// Data written by src/make_web_map.py (relative to index.html at the site root)
+const SUMMARY_URL = "map/clusters.json";
+const TILES_URL = "map/clusters.pmtiles";
 const POINTS_MAX_ZOOM = 12; // centroids are drawn below this zoom...
 const POLYGONS_MIN_ZOOM = 11; // ...and polygons from this zoom, cross-fading in between
 const MAX_SELECTED = 3; // a map can only carry 3 categorical colours that stay distinguishable

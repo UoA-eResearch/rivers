@@ -4,7 +4,7 @@
 
 This repository contains code and data for analyzing erosion and sedimentation patterns in the Gisborne region of New Zealand using Digital Elevation Model (DEM) data from 2018-2020 and 2023, along with NDVI (Normalized Difference Vegetation Index) satellite imagery.
 
-**[Browse the clusters on the interactive map](https://uoa-eresearch.github.io/rivers/map/)**
+**[Browse the clusters on the interactive map](https://uoa-eresearch.github.io/rivers/)**
 
 ## Table of Contents
 
@@ -53,8 +53,9 @@ The analysis identifies areas where the elevation changed by more than about hal
 │   ├── download_NDVI.py           # Script to download NDVI data from Google Earth Engine
 │   ├── make_web_map.py            # Builds the interactive map's data from the clusters
 │   └── create_example_visualizations.py # Generates the README example maps
-├── map/                            # Interactive cluster map (GitHub Pages)
-│   ├── index.html, app.js, style.css
+├── index.html                      # Interactive cluster map (GitHub Pages site root)
+├── map/                            # The map's script, styles and data
+│   ├── app.js, style.css
 │   ├── clusters.pmtiles           # Vector tiles of the clustered polygons (generated)
 │   └── clusters.json              # Field ranges and cluster summaries (generated)
 ├── notebooks/                      # Jupyter notebooks
@@ -271,7 +272,7 @@ K-means clustering groups similar erosion/deposition patterns:
 
 ### Interactive Map
 
-The [interactive map](https://uoa-eresearch.github.io/rivers/map/) (hosted with GitHub Pages from `map/`) shows every polygon, as dots when zoomed out and as shapes when zoomed in. You can:
+The [interactive map](https://uoa-eresearch.github.io/rivers/) (`index.html`, hosted with GitHub Pages; its script, styles and data are in `map/`) shows every polygon, as dots when zoomed out and as shapes when zoomed in. You can:
 - Highlight up to three clusters to compare (the rest stay grey), from the cluster table or a polygon's popup
 - Compare the highlighted clusters' profiles: where each cluster's median slope, elevation change, NDVI, etc. sits among all areas, as a chart or table
 - Colour the polygons by a variable instead (elevation change, slope, curvature, distance to river, NDVI and, once the pipeline has been rerun, the hydrological and connectivity indices)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the data for the interactive cluster map in ``map/``.
+"""Build the data for the interactive cluster map (``index.html``, assets in ``map/``).
 
 Reads ``data/clusters.parquet`` (written by ``notebooks/clustering.ipynb``) and writes:
 
