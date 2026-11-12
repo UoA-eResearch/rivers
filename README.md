@@ -32,7 +32,7 @@ The analysis identifies areas where the elevation changed by more than about hal
 - **Hydrological indices** (WhiteboxTools): downslope distance to stream, elevation above stream, depth to water, topographic wetness index (TWI), stream power index (SPI)
 - **Sediment connectivity**: Borselli et al. (2008) index of connectivity, weighted by slope and land cover
 - **Vegetation indices**: NDVI in 2018 and 2023, and the change between them
-- **Land cover data**: LCDB (Land Cover Database) 2018 class of each polygon
+- **Land cover data**: LCDB v6.0 (Land Cover Database) 2018 class of each polygon, plus its 2023 class
 - **Geology**: rock type, geological unit and age from the GNS Science 1:250 000 geological map, and the share of each polygon inside mapped landslides
 - **River polygons**: change polygons are split at river polygon boundaries BEFORE feature extraction
 - **Clustering**: weighted k-means clustering to identify similar erosion/deposition patterns
@@ -45,7 +45,7 @@ The analysis identifies areas where the elevation changed by more than about hal
 │   ├── NDVI_2018.tif              # NDVI raster for 2018
 │   ├── NDVI_2023.tif              # NDVI raster for 2023
 │   ├── REC2_geodata_version_5.zip # River Environment Classification data
-│   ├── lris-lcdb-v50-*.zip        # Land Cover Database
+│   ├── lris-lcdb-v50-*.zip        # Land Cover Database v5.0 (no longer used; v6.0 is fetched from LRIS)
 │   ├── lds-nz-river-polygons-*.zip # NZ river polygons
 │   ├── study_area/                # Study-area extracts of REC2, LCDB, river polygons and GNS geology (plain git)
 │   ├── areas.parquet              # Elevation change polygons with features
@@ -237,8 +237,9 @@ For each erosion/deposition polygon, the following features are extracted. Unles
 - `tile`: DEM tile the polygon came from
 - `area`: Polygon area in m²
 - `distance_to_river`: Distance to nearest REC2 stream (m)
-- `Class_2018`: LCDB 2018 land cover class covering most of the polygon
+- `Class_2018`: LCDB v6.0 2018 land cover class covering most of the polygon
 - `Wetland_18`, `Onshore_18`: LCDB wetland and onshore flags of that class
+- `Class_2023`: LCDB v6.0 2023 land cover class covering most of the polygon
 - `in_river`: True for (parts of) polygons inside a river polygon
 - `split_by_river`: True for parts of polygons that straddled a river polygon boundary
 
@@ -260,7 +261,7 @@ For each erosion/deposition polygon, the following features are extracted. Unles
 
 **Connectivity index.** IC = log10(D_up / D_dn) (Borselli et al. 2008), where D_up = W̄ · S̄ · √A uses the mean weighting factor W̄ and slope S̄ of the upslope contributing area A, and D_dn = Σ dᵢ / (Wᵢ · Sᵢ) sums along the D8 flow path to the nearest stream cell. S is the slope gradient bounded to 0.005-1 m/m (Cavalli et al. 2013), and W is a RUSLE cover-management (C) factor assigned to each LCDB class (`LCDB_C_FACTOR` in `src/batch.py`). The C-factor values are indicative and should be reviewed for the study area. Cells whose flow path leaves the buffered tile before reaching a stream have no value.
 
-**Land cover and geology.** Each polygon gets the LCDB class and the GNS geological unit covering the largest part of its area. The geological map is at 1:250 000 (positional accuracy of hundreds of metres), so it describes the setting of an area rather than the rock exactly beneath it.
+**Land cover and geology.** Each polygon gets the LCDB class and the GNS geological unit covering the largest part of its area. The 2018 land cover (before the change) is used for the clustering and the connectivity weights. The 2023 land cover was mapped after much of the change, so it describes the outcome (e.g. new landslide or harvested-forest areas); it is kept as a column and shown on the map, and can be added to the clustering through `GROUP_WEIGHTS` in the notebook. The geological map is at 1:250 000 (positional accuracy of hundreds of metres), so it describes the setting of an area rather than the rock exactly beneath it.
 
 **Soil and land use.** Soil (S-map, the Fundamental Soil Layers) and NZLRI land use capability, rock and erosion data aren't used. The NZLRI and FSL layers on the Manaaki Whenua LRIS portal are under the Landcare Data Use Licence, which doesn't allow the data or derivatives to be passed to third parties, and S-map is CC BY-NC-ND, so results derived from them couldn't be published here. The GNS geological map (CC BY 4.0) is used for rock type instead.
 
@@ -308,18 +309,18 @@ Implemented:
 - [x] **Additional terrain indices**: TWI (Topographic Wetness Index), SPI (Stream Power Index)
 - [x] **Geology**: rock type, unit, age and mapped landslides from the GNS 1:250 000 geological map
 - [x] **Study-area extracts** of the reference layers committed in `data/study_area/`, so runs don't download the national archives (~1.2 GB of LFS bandwidth)
+- [x] **LCDB v6.0**, which adds 2023 land cover, in place of v5.0
 
 Possible next steps:
 
 - [ ] **Soil and land use**: S-map, the Fundamental Soil Layers and NZLRI aren't openly licensed (see [Methods and Limitations](#methods-and-limitations)); using them would need permission from Manaaki Whenua – Landcare Research
-- [ ] **LCDB v6.0**, which adds 2023 land cover (CC BY 4.0), in place of v5.0
 
 ## Data Sources
 
 - **DEM Data**: LINZ Gisborne 1m DEM (2018-2020, 2023) via AWS S3
 - **NDVI Data**: Copernicus Sentinel-2 via Google Earth Engine
 - **River Network**: NIWA River Environment Classification (REC2) v5
-- **Land Cover**: Manaaki Whenua – Landcare Research LCDB v5.0 (CC BY 4.0)
+- **Land Cover**: Manaaki Whenua – Landcare Research LCDB v6.0 (CC BY 4.0)
 - **River Polygons**: LINZ NZ River Polygons (Topo, 1:50k) (CC BY 4.0)
 - **Geology**: © GNS Science 2023. Heron, D.W. (custodian) 2023: Geological Map of New Zealand 1:250 000 (4th ed.) [digital data]. Lower Hutt (NZ): GNS Science. https://doi.org/10.21420/5XTJ-5718 (CC BY 4.0)
 

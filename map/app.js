@@ -44,7 +44,7 @@ const SATELLITE_SOURCE = {
 };
 
 const DATA_ATTRIBUTION =
-  'Elevation: <a href="https://www.linz.govt.nz/">LINZ</a> · Land cover: LCDB v5.0, Manaaki Whenua · ' +
+  'Elevation: <a href="https://www.linz.govt.nz/">LINZ</a> · Land cover: LCDB v6.0, Manaaki Whenua · ' +
   'Geology © <a href="https://doi.org/10.21420/5XTJ-5718">GNS Science</a> 2023 (CC BY 4.0)';
 
 // Labels for the two ends of diverging scales
@@ -443,6 +443,8 @@ function popupContent(props) {
       el("strong", {}, formatValue(f, props[f.key], { signed: f.key.startsWith("dz") }))));
   const landCover = landCoverName(props.lcdb);
   if (landCover) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Land cover 2018"), el("strong", {}, landCover)));
+  const landCover2023 = landCoverName(props.lcdb23);
+  if (landCover2023) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Land cover 2023"), el("strong", {}, landCover2023)));
   if (props.rock) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Rock type"), el("strong", {}, props.rock)));
   if (props.unit) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Geological unit"), el("strong", {}, props.unit)));
   if (props.in_river === 1) rows.push(el("div", { class: "popup-row" }, el("span", {}, "Location"), el("strong", {}, "In a river channel")));

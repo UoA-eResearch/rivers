@@ -62,10 +62,10 @@ FIELDS = [
 
 SCALE = {"landslide": 100}  # stored as a fraction, shown as a percentage
 
-LCDB_CLASSES = {
-    1: "Built-up Area (settlement)", 2: "Urban Parkland/Open Space", 5: "Transport Infrastructure",
-    6: "Surface Mine or Dump", 10: "Sand or Gravel", 12: "Landslide", 14: "Permanent Snow and Ice",
-    15: "Alpine Grass/Herbfield", 16: "Gravel or Rock", 20: "Lake or Pond", 21: "River",
+LCDB_CLASSES = {  # LCDB v6.0 class names
+    0: "Not land", 1: "Built-up Area (settlement)", 2: "Urban Parkland/Open Space", 5: "Transport Infrastructure",
+    6: "Surface Mine or Dump", 10: "Sand and Gravel", 12: "Landslide", 14: "Permanent Snow and Ice",
+    15: "Alpine Grass/Herbfield", 16: "Gravel and Rock", 20: "Lake or Pond", 21: "River",
     22: "Estuarine Open Water", 30: "Short-rotation Cropland", 33: "Orchard, Vineyard or Other Perennial Crop",
     40: "High Producing Exotic Grassland", 41: "Low Producing Grassland", 43: "Tall Tussock Grassland",
     44: "Depleted Grassland", 45: "Herbaceous Freshwater Vegetation", 46: "Herbaceous Saline Vegetation",
@@ -103,6 +103,8 @@ def build_attributes(df, fields):
         attrs[key] = (df[column].astype(float) * SCALE.get(key, 1)).round(decimals).values
     if "Class_2018" in df:
         attrs["lcdb"] = pd.to_numeric(df["Class_2018"], errors="coerce").values
+    if "Class_2023" in df:
+        attrs["lcdb23"] = pd.to_numeric(df["Class_2023"], errors="coerce").values
     if "in_river" in df:
         attrs["in_river"] = df["in_river"].astype("boolean").fillna(False).astype(int).values
     for key, column in (("rock", "rock_group"), ("unit", "rock_unit")):
@@ -211,7 +213,7 @@ def main(source, out_dir):
         subprocess.run([
             "tile-join", "--force", "--quiet", "--no-tile-size-limit", "-o", out_path,
             "--name", "Gisborne erosion and deposition clusters",
-            "--attribution", "Elevation: LINZ (CC BY 4.0) · Land cover: LCDB v5.0, Manaaki Whenua (CC BY 4.0)"
+            "--attribution", "Elevation: LINZ (CC BY 4.0) · Land cover: LCDB v6.0, Manaaki Whenua (CC BY 4.0)"
             " · Geology © GNS Science 2023 (CC BY 4.0)",
             os.path.join(tmp, "points.pmtiles"), os.path.join(tmp, "polygons.pmtiles"),
         ], check=True)

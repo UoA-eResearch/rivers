@@ -9,14 +9,14 @@ downloads) or the GNS geology package (400 MB).
 | File | Contents | Source | Licence |
 |---|---|---|---|
 | `rec2.parquet` | River network lines (`nzsegment`, `StreamOrde`, `CUM_AREA`) | NIWA River Environment Classification (REC2) v5, `data/REC2_geodata_version_5.zip` | No licence stated; freely downloadable from NIWA, and the full archive is already in this repository |
-| `lcdb.parquet` | Land cover polygons (`Class_2018`, `Wetland_18`, `Onshore_18`) | Manaaki Whenua – Landcare Research, LCDB v5.0, `data/lris-lcdb-v50-*.zip` | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| `lcdb.parquet` | Land cover polygons (`Class_2018`, `Wetland_18`, `Onshore_18`, `Class_2023`) | Manaaki Whenua – Landcare Research, LCDB v6.0 ([LRIS layer 123148](https://lris.scinfo.org.nz/layer/123148)), fetched from the LRIS WFS | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
 | `river_polygons.parquet` | River polygons | LINZ NZ River Polygons (Topo, 1:50k), `data/lds-nz-river-polygons-*.zip` | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
 | `geology.parquet` | Geological units (`ROCKGROUP`, `KEYGRPNAME`, `SIMPLENAME`, `ABSMIN_MA`, `ABSMAX_MA`) | GNS Science Geological Map of New Zealand 1:250 000, 4th edition (2023) | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
 | `landslides.parquet` | Mapped landslide units | As above | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
 
 Attribution:
 
-- Land cover: LCDB v5.0, Manaaki Whenua – Landcare Research, licensed under CC BY 4.0.
+- Land cover: LCDB v6.0, Manaaki Whenua – Landcare Research, licensed under CC BY 4.0.
 - River polygons: sourced from the LINZ Data Service, licensed under CC BY 4.0.
 - Geology: © GNS Science 2023. Heron, D.W. (custodian) 2023: Geological Map of New
   Zealand 1:250 000 (4th ed.) [digital data]. Lower Hutt (NZ): GNS Science. (GNS
@@ -25,14 +25,19 @@ Attribution:
 ## Rebuilding
 
 The extracts are clipped to the study region, made valid and saved as zstd-compressed
-GeoParquet by `build_extracts()` in `src/batch.py`. To rebuild them, fetch the national
-archives with `git lfs pull --include="data/*.zip"` and run:
+GeoParquet by `build_extracts()` in `src/batch.py`. To rebuild all of them, fetch the
+REC2 and river polygon archives with
+`git lfs pull --include="data/REC2_geodata_version_5.zip,data/lds-nz-river-polygons-*.zip"`
+and run:
 
 ```bash
-python src/batch.py --stage prepare --rebuild-extracts
+LRIS_API_KEY=<your LRIS API key> python src/batch.py --stage prepare --rebuild-extracts
 ```
 
-The GNS geology package is downloaded automatically from GNS Science when needed.
+Name layers to rebuild only those, e.g. `--rebuild-extracts geology landslides`. The
+GNS geology package is downloaded automatically from GNS Science, and LCDB is fetched
+from the LRIS WFS, which needs an API key (create one in your LRIS account settings,
+with access to query layer data).
 
 ## Soil and land-use data
 

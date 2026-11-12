@@ -84,11 +84,16 @@ CRS = "EPSG:2193"
 
 REC_ZIP = f"{DATA_DIR}/REC2_geodata_version_5.zip"
 REC_GDB = "nzRec2_v5.gdb"
-LCDB_ZIP = f"{DATA_DIR}/lris-lcdb-v50-land-cover-database-version-50-mainland-new-zealand-GPKG.zip"
-LCDB_GPKG = "lcdb-v50-land-cover-database-version-50-mainland-new-zealand.gpkg"
 RIVERS_ZIP = f"{DATA_DIR}/lds-nz-river-polygons-topo-150k-GPKG.zip"
 RIVERS_GPKG = "nz-river-polygons-topo-150k.gpkg"
+# LCDB v6.0 (Manaaki Whenua - Landcare Research, CC BY 4.0), fetched from the LRIS
+# portal's WFS when the extracts are rebuilt (needs an LRIS API key in LRIS_API_KEY).
+LCDB_LAYER = 123148  # LCDB v6.0 - Land Cover Database version 6.0, Mainland, New Zealand
+LRIS_WFS = "https://lris.scinfo.org.nz/services/wfs"
+# 2018 land cover (before the change) is used for the features and the connectivity
+# weights; 2023 land cover (after it) is kept for reference.
 LCDB_COLUMNS = ["Class_2018", "Wetland_18", "Onshore_18"]
+LCDB_2023_COLUMNS = ["Class_2023"]
 # GNS Science Geological Map of New Zealand 1:250 000, 4th edition (CC BY 4.0).
 # Not stored in the repository; downloaded when the extracts are rebuilt.
 GEOLOGY_ZIP = f"{DATA_DIR}/NZL_GNS_250K_Geology_2023_Data_Package.zip"
@@ -99,14 +104,18 @@ GEOLOGY_COLUMNS = ["ROCKGROUP", "KEYGRPNAME", "SIMPLENAME", "ABSMIN_MA", "ABSMAX
 DOWNLOADS = {GEOLOGY_ZIP: GEOLOGY_URL}
 
 # Reference layers, clipped to the study area and committed to data/study_area/ so
-# runs don't need the national archives (~1.2 GB from Git LFS). Rebuild them with
-# --rebuild-extracts: name -> (archive, file in the archive, pyogrio read options)
+# runs don't need the national datasets (~1.2 GB from Git LFS). Rebuild them with
+# --rebuild-extracts. Each comes from a file in an archive (read with pyogrio) or
+# from an LRIS WFS layer.
 REFERENCE_LAYERS = {
-    "rec2": (REC_ZIP, REC_GDB, dict(layer="riverlines", columns=["nzsegment", "StreamOrde", "CUM_AREA"])),
-    "lcdb": (LCDB_ZIP, LCDB_GPKG, dict(columns=LCDB_COLUMNS)),
-    "river_polygons": (RIVERS_ZIP, RIVERS_GPKG, dict(columns=[])),
-    "geology": (GEOLOGY_ZIP, GEOLOGY_GDB, dict(layer="NZL_GNS_250K_geological_units", columns=GEOLOGY_COLUMNS)),
-    "landslides": (GEOLOGY_ZIP, GEOLOGY_GDB, dict(layer="NZL_GNS_250K_landslide_units", columns=[])),
+    "rec2": dict(archive=REC_ZIP, member=REC_GDB,
+                 read=dict(layer="riverlines", columns=["nzsegment", "StreamOrde", "CUM_AREA"])),
+    "lcdb": dict(lris_layer=LCDB_LAYER, columns=LCDB_COLUMNS + LCDB_2023_COLUMNS),
+    "river_polygons": dict(archive=RIVERS_ZIP, member=RIVERS_GPKG, read=dict(columns=[])),
+    "geology": dict(archive=GEOLOGY_ZIP, member=GEOLOGY_GDB,
+                    read=dict(layer="NZL_GNS_250K_geological_units", columns=GEOLOGY_COLUMNS)),
+    "landslides": dict(archive=GEOLOGY_ZIP, member=GEOLOGY_GDB,
+                       read=dict(layer="NZL_GNS_250K_landslide_units", columns=[])),
 }
 
 # Change detection
@@ -141,15 +150,16 @@ NODATA = -9999.0
 # and sediment efficiently even though they do not erode, and open water is
 # given 1 (no impedance).
 LCDB_C_FACTOR = {
+    0: 1.0,     # Not land (sea in that year, e.g. where the coastline moved)
     1: 0.1,     # Built-up Area (settlement)
     2: 0.05,    # Urban Parkland/Open Space
     5: 0.1,     # Transport Infrastructure
     6: 0.5,     # Surface Mine or Dump
-    10: 0.5,    # Sand or Gravel
+    10: 0.5,    # Sand and Gravel
     12: 0.5,    # Landslide
     14: 0.001,  # Permanent Snow and Ice
     15: 0.04,   # Alpine Grass/Herbfield
-    16: 0.1,    # Gravel or Rock
+    16: 0.1,    # Gravel and Rock
     20: 1.0,    # Lake or Pond
     21: 1.0,    # River
     22: 1.0,    # Estuarine Open Water
@@ -335,25 +345,69 @@ def study_region(indexes):
                   HYDRO_BUFFER + STREAM_SNAP_DISTANCE + 1000)
 
 
-def build_extracts(region, force=False):
-    """Clip the national reference layers to the study region, into data/study_area/."""
+def read_lris_wfs(layer, bounds, columns, key, page_size=5000):
+    """Features of an LRIS layer intersecting ``bounds`` (NZTM), fetched page by page from its WFS."""
+    frames, start = [], 0
+    while True:
+        params = dict(
+            service="WFS", version="2.0.0", request="GetFeature", typeNames=f"layer-{layer}",
+            outputFormat="application/json", srsName="EPSG:2193", sortBy="LCDB_UID",
+            propertyName=",".join(columns + ["GEOMETRY"]), count=page_size, startIndex=start,
+            bbox=",".join(str(b) for b in bounds) + ",EPSG:2193",
+        )
+        # The key goes in a header so it can't end up in URLs or error messages
+        r = requests.get(LRIS_WFS, params=params, headers={"Authorization": f"key {key}"}, timeout=600)
+        if r.status_code != 200:
+            raise RuntimeError(f"LRIS WFS request for layer {layer} failed: HTTP {r.status_code}")
+        features = r.json()["features"]
+        if features:
+            frames.append(gpd.GeoDataFrame.from_features(features, crs=CRS))
+        start += len(features)
+        print(f"  fetched {start} features of layer {layer}")
+        if len(features) < page_size:
+            break
+    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=CRS)[columns + ["geometry"]]
+
+
+def read_reference_layer(name, region):
+    """Read one reference layer for the region from its national source, or None if unavailable."""
+    spec = REFERENCE_LAYERS[name]
+    if "lris_layer" in spec:
+        key = os.environ.get("LRIS_API_KEY")
+        if not key:
+            print(f"Set LRIS_API_KEY to an LRIS portal API key to rebuild the {name} extract")
+            return None
+        return read_lris_wfs(spec["lris_layer"], region, spec["columns"], key)
+    archive = spec["archive"]
+    if not os.path.exists(archive) and archive in DOWNLOADS:
+        print(f"Downloading {DOWNLOADS[archive]}...")
+        with requests.get(DOWNLOADS[archive], stream=True, timeout=600) as r:
+            r.raise_for_status()
+            with open(archive, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+    if not os.path.exists(archive):
+        print(f"{archive} not found, can't rebuild the {name} extract")
+        return None
+    source = f"/vsizip/{os.path.abspath(archive)}/{spec['member']}"  # read in place, without unzipping
+    return gpd.read_file(source, bbox=region, engine="pyogrio", **spec["read"])
+
+
+def build_extracts(region, rebuild=None):
+    """Clip the reference layers to the study region, into data/study_area/.
+
+    Missing extracts are always built; ``rebuild`` lists layers to rebuild anyway
+    (an empty list means all of them).
+    """
     os.makedirs(STUDY_AREA_DIR, exist_ok=True)
-    for name, (zip_path, member, kwargs) in REFERENCE_LAYERS.items():
+    for name in REFERENCE_LAYERS:
         out_path = f"{STUDY_AREA_DIR}/{name}.parquet"
-        if os.path.exists(out_path) and not force:
-            continue
-        if not os.path.exists(zip_path) and zip_path in DOWNLOADS:
-            print(f"Downloading {DOWNLOADS[zip_path]}...")
-            with requests.get(DOWNLOADS[zip_path], stream=True, timeout=600) as r:
-                r.raise_for_status()
-                with open(zip_path, "wb") as f:
-                    shutil.copyfileobj(r.raw, f)
-        if not os.path.exists(zip_path):
-            print(f"{zip_path} not found, can't build {out_path}")
+        forced = rebuild is not None and (not rebuild or name in rebuild)
+        if os.path.exists(out_path) and not forced:
             continue
         start = time.time()
-        source = f"/vsizip/{os.path.abspath(zip_path)}/{member}"  # read in place, without unzipping
-        gdf = gpd.read_file(source, bbox=region, engine="pyogrio", **kwargs)
+        gdf = read_reference_layer(name, region)
+        if gdf is None:
+            continue
         gdf = gdf.to_crs(CRS)
         gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()]
         gdf["geometry"] = gdf.geometry.make_valid()
@@ -363,7 +417,7 @@ def build_extracts(region, force=False):
         print(f"Extracted {name}: {len(gdf)} features in {time.time() - start:.1f}s")
 
 
-def prepare(force=False, rebuild_extracts=False):
+def prepare(force=False, rebuild_extracts=None):
     """Build the DEM tile indexes and VRTs, and any missing study-area extracts."""
     os.makedirs(PREPARED_DIR, exist_ok=True)
     indexes = {}
@@ -373,7 +427,7 @@ def prepare(force=False, rebuild_extracts=False):
             build_tile_index(epoch).to_csv(index_path, index=False)
         indexes[epoch] = pd.read_csv(index_path)
         write_vrt(indexes[epoch], f"{PREPARED_DIR}/dem_{epoch}.vrt")
-    build_extracts(study_region(indexes), force=rebuild_extracts)
+    build_extracts(study_region(indexes), rebuild=rebuild_extracts)
 
 
 def load_references():
@@ -705,10 +759,12 @@ def dominant_attributes(areas, layer, columns):
 
 
 def dominant_land_cover(areas, lcdb):
-    """LCDB attributes of the land-cover class covering most of each polygon."""
+    """LCDB 2018 attributes, and the 2023 class, of the land cover covering most of each polygon."""
     out = dominant_attributes(areas, lcdb, LCDB_COLUMNS)
     for col in ("Wetland_18", "Onshore_18"):
         out[col] = out[col].map({"yes": True, "no": False, True: True, False: False})
+    if lcdb is not None and "Class_2023" in lcdb:
+        out["Class_2023"] = dominant_attributes(areas, lcdb, LCDB_2023_COLUMNS)["Class_2023"]
     return out
 
 
@@ -887,7 +943,7 @@ def finalize(force_rebuild=False):
 # Entry point
 # ---------------------------------------------------------------------------
 def main(force_rebuild=False, stage="all", tiles=None, shard=0, num_shards=1, keep_intermediate=False,
-         rebuild_extracts=False):
+         rebuild_extracts=None):
     """Run the pipeline.
 
     Args:
@@ -898,7 +954,8 @@ def main(force_rebuild=False, stage="all", tiles=None, shard=0, num_shards=1, ke
         tiles: optional list of tile names to process.
         shard, num_shards: process every ``num_shards``-th tile starting at ``shard``.
         keep_intermediate: keep the WhiteboxTools rasters in wbt_outputs/.
-        rebuild_extracts: rebuild data/study_area/ from the national archives.
+        rebuild_extracts: names of data/study_area/ extracts to rebuild from the national
+            datasets (an empty list rebuilds all of them).
     """
     print(f"Starting batch processing (stage: {stage})...")
     failed = []
@@ -923,8 +980,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards")
     parser.add_argument("--keep-intermediate", action="store_true",
                         help="Keep WhiteboxTools intermediate rasters in wbt_outputs/")
-    parser.add_argument("--rebuild-extracts", action="store_true",
-                        help=f"Rebuild {STUDY_AREA_DIR}/ from the national archives in {DATA_DIR}/")
+    parser.add_argument("--rebuild-extracts", nargs="*", choices=list(REFERENCE_LAYERS), metavar="LAYER",
+                        help=f"Rebuild these extracts in {STUDY_AREA_DIR}/ (default: all) from the national "
+                             f"datasets; LCDB needs an LRIS API key in LRIS_API_KEY")
     args = parser.parse_args()
     failed_tiles = main(args.force_rebuild, args.stage, args.tiles, args.shard, args.num_shards,
                         args.keep_intermediate, args.rebuild_extracts)
