@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gisborne Erosion Clusters</title>
+  <meta name="description" content="Interactive map of areas of erosion and deposition in Gisborne, New Zealand, between the 2018-2020 and 2023 LiDAR surveys, grouped by k-means cluster.">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css"
+        integrity="sha384-uTttxo/aOKbdE5RlD/SPzSDoDmNvGlUYPjONi2MN/b7c9HPSvW07OIuyP7uL6jxK" crossorigin="anonymous">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"
+          integrity="sha384-5+cfbwT0iiub6VsQAdn6yz16nr6sDiQoHx6tm4O8OVYXHYOxcffFmCJBL0dgdvGp" crossorigin="anonymous" defer></script>
+  <script src="https://unpkg.com/pmtiles@4.4.1/dist/pmtiles.js"
+          integrity="sha384-iS2/cbFYol4NsEeda4mW6N/8wPMOT6pv2eY+GNYSJRqVC4nbJECP1+mg6D2T8wT/" crossorigin="anonymous" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div id="app">
+    <main id="map" aria-label="Map of erosion and deposition areas"></main>
+
+    <aside id="panel" aria-label="Map controls and legend">
+      <header class="panel-header">
+        <div>
+          <h1>Erosion &amp; deposition clusters</h1>
+          <p class="subtitle">Gisborne, New Zealand · LiDAR 2018–20 to 2023</p>
+        </div>
+        <button id="panel-toggle" class="icon-button" type="button" aria-expanded="true" aria-controls="panel-body" title="Hide panel">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+        </button>
+      </header>
+
+      <div id="panel-body">
+        <p id="meta" class="meta"></p>
+
+        <div class="controls">
+          <label class="control">
+            <span>Colour by</span>
+            <select id="colour-by"></select>
+          </label>
+          <div class="control">
+            <span id="change-label">Show</span>
+            <div class="segmented" role="radiogroup" aria-labelledby="change-label" data-setting="change">
+              <button type="button" role="radio" data-value="all">All</button>
+              <button type="button" role="radio" data-value="erosion">Erosion</button>
+              <button type="button" role="radio" data-value="deposition">Deposition</button>
+            </div>
+          </div>
+          <div class="control">
+            <span id="basemap-label">Basemap</span>
+            <div class="segmented" role="radiogroup" aria-labelledby="basemap-label" data-setting="basemap">
+              <button type="button" role="radio" data-value="map">Map</button>
+              <button type="button" role="radio" data-value="satellite">Satellite</button>
+            </div>
+          </div>
+        </div>
+
+        <section id="legend" aria-label="Legend"></section>
+        <section id="clusters" aria-label="Clusters"></section>
+        <section id="profile" aria-label="Cluster profiles" hidden></section>
+
+        <footer class="panel-footer">
+          <p>Each shape is an area of at least 4000 m² where the ground rose or fell by more than about half a metre between the LiDAR surveys. Areas are grouped by weighted k-means clustering of their terrain, vegetation, land-cover and hydrological features.</p>
+          <p><a href="https://github.com/UoA-eResearch/rivers">Code and method</a> · <a href="../clustering.html">Clustering notebook</a></p>
+        </footer>
+      </div>
+    </aside>
+
+    <div id="tooltip" role="tooltip" hidden></div>
+    <div id="loading" role="status">Loading map…</div>
+  </div>
+</body>
+</html>

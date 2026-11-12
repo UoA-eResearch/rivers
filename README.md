@@ -4,6 +4,8 @@
 
 This repository contains code and data for analyzing erosion and sedimentation patterns in the Gisborne region of New Zealand using Digital Elevation Model (DEM) data from 2018-2020 and 2023, along with NDVI (Normalized Difference Vegetation Index) satellite imagery.
 
+**[Browse the clusters on the interactive map](https://uoa-eresearch.github.io/rivers/map/)**
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -49,7 +51,12 @@ The analysis identifies areas where the elevation changed by more than about hal
 ├── src/                            # Python source code
 │   ├── batch.py                   # Main processing pipeline
 │   ├── download_NDVI.py           # Script to download NDVI data from Google Earth Engine
+│   ├── make_web_map.py            # Builds the interactive map's data from the clusters
 │   └── create_example_visualizations.py # Generates the README example maps
+├── map/                            # Interactive cluster map (GitHub Pages)
+│   ├── index.html, app.js, style.css
+│   ├── clusters.pmtiles           # Vector tiles of the clustered polygons (generated)
+│   └── clusters.json              # Field ranges and cluster summaries (generated)
 ├── notebooks/                      # Jupyter notebooks
 │   ├── EDA.ipynb                  # Exploratory data analysis
 │   └── clustering.ipynb           # Weighted k-means clustering and visualization
@@ -185,7 +192,7 @@ This will:
 The repository includes a GitHub Actions workflow that runs the whole pipeline monthly (or when triggered manually):
 - **prepare**: checks out the REC2, LCDB and river polygon archives from LFS and extracts the study area
 - **tiles**: 30 parallel jobs each process a share of the DEM tiles (a single job would exceed GitHub's 6 hour limit)
-- **finalize**: joins the tiles, adds NDVI, runs the clustering notebook, and commits `data/areas.parquet`, `data/clusters.parquet`, `notebooks/clustering.ipynb` and `clustering.html` back to the repository
+- **finalize**: joins the tiles, adds NDVI, runs the clustering notebook, rebuilds the interactive map's data, and commits `data/areas.parquet`, `data/clusters.parquet`, `notebooks/clustering.ipynb`, `clustering.html` and `map/clusters.*` back to the repository
 
 If a tile fails, its job is marked as failed and nothing is committed; use "Re-run failed jobs" to retry it, after which the finalize job runs. With the `load_areas_from_file` option the tile jobs are skipped and the existing `data/areas.parquet` is used.
 
@@ -262,12 +269,24 @@ K-means clustering groups similar erosion/deposition patterns:
 
 ![Clustering visualization showing k-means results with 25 clusters](clustering_example.png)
 
-### Interactive Maps
+### Interactive Map
 
-The clustering notebook generates interactive Folium maps that can be explored in a web browser, showing:
-- Cluster assignments
-- Feature values on hover
-- Satellite imagery basemap
+The [interactive map](https://uoa-eresearch.github.io/rivers/map/) (hosted with GitHub Pages from `map/`) shows every polygon, as dots when zoomed out and as shapes when zoomed in. You can:
+- Highlight up to three clusters to compare (the rest stay grey), from the cluster table or a polygon's popup
+- Compare the highlighted clusters' profiles: where each cluster's median slope, elevation change, NDVI, etc. sits among all areas, as a chart or table
+- Colour the polygons by a variable instead (elevation change, slope, curvature, distance to river, NDVI and, once the pipeline has been rerun, the hydrological and connectivity indices)
+- Show only erosion or only deposition, switch between a map and satellite basemap, and click a polygon for its values
+- Share a view: the selection, colouring and position are kept in the URL
+
+Only three clusters are coloured at a time because more categorical colours can't be told apart reliably on a map, especially with colour-vision deficiency.
+
+The map data is regenerated from `data/clusters.parquet` by the workflow; to rebuild it by hand (requires [tippecanoe](https://github.com/felt/tippecanoe), e.g. `apt install tippecanoe`):
+
+```bash
+python src/make_web_map.py
+```
+
+The clustering notebook also draws a Folium map of one tile.
 
 ## Future Enhancements
 
