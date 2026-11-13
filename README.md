@@ -102,7 +102,7 @@ The pipeline has three stages, which run in sequence by default:
 
 The clustering notebook:
 - Loads the processed data with NDVI features
-- Groups the features by the variable they describe (e.g. the 15 slope statistics, the 5 TWI statistics, distance to river) and weights them so every variable contributes equally to the k-means distance, regardless of how many columns describe it (weights can be changed with `GROUP_WEIGHTS`)
+- Groups the features by the variable they describe (e.g. the 15 slope statistics, the 5 TWI statistics, distance to river) and weights them so every variable contributes equally to the k-means distance, regardless of how many columns describe it (weights can be changed with `GROUP_WEIGHTS`). It currently uses 229 columns in 25 groups (see [Feature Counts](#feature-counts))
 - One-hot encodes the LCDB land-cover class and the GNS rock group, and log-transforms the heavily skewed polygon area, rock age and SPI
 - Performs K-means clustering (k=25)
 - Visualizes results on interactive maps
@@ -248,6 +248,28 @@ For each erosion/deposition polygon, the following features are extracted. Unles
 - `rock_unit`, `rock_name`: its stratigraphic group (e.g. East Coast Allochthon, Tolaga Group) and description
 - `rock_age`: midpoint of the unit's age range (millions of years)
 - `landslide_share`: share of the polygon inside landslides mapped by GNS (0-1)
+
+### Feature Counts
+
+`data/areas+NDVI.parquet` has 195 columns: 192 values describing each polygon, plus `geometry`, `tile` and `split_by_river` (`data/clusters.parquet` adds `cluster`). For the clustering, the land-cover class and rock type are one-hot encoded, giving 229 columns in 25 equally weighted groups (each 4% of the k-means distance): elevation, elevation change, each of the 8 terrain attributes, each of the 6 hydrological indices, NDVI, NDVI change, area, distance to river, in river channel, land cover, rock type, rock age and share in mapped landslides.
+
+| Group | Values per polygon | Clustering columns |
+|---|---:|---:|
+| Elevation (2018-2020 and 2023) | 10 | 10 |
+| Elevation change | 5 | 5 |
+| Terrain attributes (8 attributes × old/new/diff × 5 statistics) | 120 | 120 |
+| Hydrological indices (6 indices × 5 statistics) | 30 | 30 |
+| NDVI (2018 and 2023) | 10 | 10 |
+| NDVI change | 5 | 5 |
+| Area, distance to river, in river channel | 3 | 3 |
+| Land cover 2018 (class, wetland and onshore flags) | 3 | 32 (one-hot: 30 classes + 2 flags) |
+| Rock type | 1 | 12 (one-hot) |
+| Rock age, share in mapped landslides | 2 | 2 |
+| Land cover 2023 | 1 | 0 (off by default; see `GROUP_WEIGHTS`) |
+| Geological unit and description | 2 | 0 (descriptive) |
+| **Total** | **192** | **229** |
+
+The one-hot column counts depend on which land-cover classes and rock types occur in the data; the numbers above are from the November 2026 run. The interactive map shows 19 of the values.
 
 ## Methods and Limitations
 
